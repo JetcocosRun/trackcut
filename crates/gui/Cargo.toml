@@ -1,0 +1,17 @@
+[package]
+name = "trackcut"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trackcut"
+path = "src/main.rs"
+
+[dependencies]
+trackcut-core = { path = "../core" }
+eframe = "0.31"
+rfd = "0.15"
+rodio = "0.19"
+tracing.workspace = true
+tracing-subscriber.workspace = true

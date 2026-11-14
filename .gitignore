@@ -1,0 +1,9 @@
+/target
+/tools/ffmpeg
+/tools/mkvtoolnix
+/tools/downloads
+/.cargo/config.toml
+/demo/*_clean.*
+/demo/*.wav
+/demo/*.png
+*.log

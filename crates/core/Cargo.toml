@@ -1,0 +1,15 @@
+[package]
+name = "trackcut-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "trackcut_core"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+which.workspace = true

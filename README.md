@@ -1,0 +1,144 @@
+# TrackCut
+
+Удаление ненужных дорожек из MKV и других контейнеров **без перекодирования**.
+Видео и оставшиеся аудио/субтитры копируются бит-в-бит, меняется только состав дорожек.
+
+GUI на Rust (`eframe`/`egui`), ядро и CLI — отдельные крейты.
+
+## Что умеет
+
+- MKV, MP4, MOV, WebM, AVI, TS и другие контейнеры, которые понимают ffprobe/mkvmerge.
+- Показывает по каждой дорожке: тип, кодек, язык (`rus — Русский`), название перевода
+  («Дубляж», «LostFilm», …), каналы, частоту, битрейт, разрешение, FPS, размер и долю файла,
+  флаги Default/Forced и **все теги контейнера**. Если контейнер не хранит статистику,
+  битрейт и размер оцениваются по первым секундам и помечаются `≈`.
+- Прослушивание 15 секунд любой аудиодорожки — чтобы опознать перевод, если названия нет.
+- Пресеты: «Видео + лучшая аудио», «Видео + аудио», «Всё», «Только русский», «Снять все».
+- Пакетная обработка: несколько файлов, одно правило, отдельная папка вывода.
+- Сохранение глав, тегов, вложений (шрифты ASS) — для MKV.
+- Конвертация текстовых субтитров в MOV text при выводе в MP4 (единственное исключение
+  из правила «без перекодирования», включается вручную).
+- Проверка результата после сборки: повторный probe, сверка состава дорожек и длительности.
+- Отмена, атомарная запись через `.part`, исходник никогда не перезаписывается.
+
+## Требования
+
+- Windows 10/11 x64 (приложение собрано под GNU-тулчейн, работает и без MSVC).
+- [MKVToolNix](https://mkvtoolnix.download/) — `mkvmerge` (основной бэкенд для MKV/WebM).
+- [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) — `ffmpeg` и `ffprobe` (MP4/MOV, прослушивание, проверка).
+
+Приложение ищет `ffmpeg.exe`, `ffprobe.exe`, `mkvmerge.exe`:
+
+1. в переменных `TRACKCUT_FFMPEG`, `TRACKCUT_FFPROBE`, `TRACKCUT_MKVEMBLE`;
+2. в папке `tools` рядом с программой (включая подпапки, например `tools/ffmpeg/bin/`);
+3. в `PATH`.
+
+Если чего-то не хватает, вверху окна будет предупреждение и кнопка «Повторить поиск».
+
+## Быстрый старт
+
+```powershell
+.\build.ps1            # debug-сборка
+.\build.ps1 -Release   # release-сборка
+```
+
+Готовые бинарники:
+
+- `target\release\trackcut.exe` — GUI (release);
+- `target\release\trackcut-cli.exe` — консоль (release);
+- debug-варианты лежат в `target\debug\`.
+
+Запуск GUI:
+
+```powershell
+.\run.ps1                 # откроет пустое окно
+.\run.ps1 "D:\movie.mkv"  # сразу с файлом
+```
+
+Положите `ffmpeg.exe`, `ffprobe.exe` и `mkvmerge.exe` в `tools\ffmpeg\bin\` и `tools\mkvtoolnix\`
+(или установите их в PATH) и запустите `trackcut.exe`.
+
+## CLI
+
+```powershell
+# Посмотреть дорожки (номера — для --keep/--drop)
+trackcut-cli probe "D:\movie.mkv" --verbose
+
+# Удалить дорожку №2, оставить видео и русские субтитры
+trackcut-cli mux "D:\movie.mkv" --drop 2 -o "D:\movie_clean.mkv"
+
+# Оставить только дорожки 1 и 3
+trackcut-cli mux "D:\movie.mkv" --keep 1,3 -o "D:\out.mkv"
+
+# MKV → MP4 без субтитров, с главами
+trackcut-cli mux "D:\movie.mkv" --container mp4 --drop 4,5 -o "D:\out.mp4"
+
+# Показать план и команду, ничего не запускать
+trackcut-cli mux "D:\movie.mkv" --drop 2 --dry-run
+```
+
+`--keep`/`--drop` принимают номера из вывода `probe` (нумерация с 1).
+Флаг `--mov-text` разрешает конвертацию SRT/ASS → MOV text для MP4.
+
+Для проверки без своего файла есть демо:
+
+```powershell
+.\demo\make_sample.ps1     # пересоздать demo\sample.mkv
+trackcut-cli probe demo\sample.mkv
+trackcut-cli mux demo\sample.mkv --drop 3,5 -o demo\sample_clean.mkv
+```
+
+## Как это работает
+
+| Шаг | Что происходит |
+|---|---|
+| Probe | `ffprobe -show_streams -show_format -show_chapters -of json`; для MKV дополнительно `mkvmerge -J` (точные ID дорожек) |
+| Merge | теги/битрейт/размер из ffprobe объединяются с данными mkvmerge по типу и порядку дорожек |
+| Plan | выбор дорожек → аргументы `mkvmerge -a/-s/-d` или `ffmpeg -map 0:N -c copy` |
+| Mux | запуск процесса с `--gui-mode` / `-progress pipe:1`, разбор прогресса, отмена через kill |
+| Verify | повторный probe `.part`-файла: число и типы дорожек, длительность ±2 с |
+| Rename | только после проверки: `.part.mkv` → итоговое имя |
+
+Основные модули:
+
+```
+crates/core/src/model.rs    модель дорожек и метаданных
+crates/core/src/probe.rs    ffprobe + mkvmerge -J и их объединение
+crates/core/src/plan.rs     валидация, выбор бэкенда, сборка команд
+crates/core/src/exec.rs     запуск, прогресс, отмена, очистка .part
+crates/core/src/verify.rs   проверка результата
+crates/gui/src/app.rs       интерфейс
+```
+
+## Ограничения
+
+- Нет перекодирования: если контейнер не поддерживает кодек (например, H.264 в WebM),
+  приложение предложит MKV, а не будет конвертировать.
+- MP4/MOV не хранит PGS/VobSub; SRT/ASS требуют `--mov-text` (или удаления субтитров).
+- Вложения (шрифты ASS) переносит только mkvmerge; ffmpeg-бэкенд их теряет и предупреждает.
+- Прослушивание декодирует 15 секунд во временный WAV — нужен ffmpeg и аудиоустройство.
+
+## Разработка
+
+```powershell
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
+```
+
+Сборка под GNU-тулчейн:
+
+- Rust: stable, target `x86_64-pc-windows-gnu` (`rustup default stable-x86_64-pc-windows-gnu`);
+- MinGW-w64 с `gcc` в `PATH` (например, winlibs UCRT);
+- если `gcc` не в `PATH`, путь к линкеру задаётся локально в `.cargo/config.toml`
+  (этот файл не входит в репозиторий).
+
+Можно собрать и под MSVC: удалите локальный `.cargo/config.toml` и используйте
+стандартный `stable-x86_64-pc-windows-msvc`.
+
+## Roadmap
+
+- [ ] Настройки в `%APPDATA%\TrackCut\config.toml` (пути к инструментам, тема, язык).
+- [ ] Сортировка таблицы по столбцам, запоминание фильтра.
+- [ ] Извлечение дорожки в отдельный файл (без видео).
+- [ ] Обрезка по времени (не входит в текущий скоуп).
