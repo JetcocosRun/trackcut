@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::model::{Backend, MediaInfo};
-use crate::plan::{prepare, MuxPlan};
+use crate::plan::{prepare, MuxPlan, PreparedCommand};
 use crate::sys::hidden_command;
 use crate::tools::ToolPaths;
 
@@ -38,9 +38,38 @@ pub fn run_mux(
     plan: &MuxPlan,
     tools: &ToolPaths,
     cancel: Arc<AtomicBool>,
-    mut on_event: impl FnMut(ExecEvent),
+    on_event: impl FnMut(ExecEvent),
 ) -> Result<MuxOutcome> {
     let prepared = prepare(info, plan, tools)?;
+    run_prepared(prepared, info.duration_ms, cancel, on_event, |part| {
+        match crate::verify::verify_output(part, info, plan, tools) {
+            Ok(report) => Ok(report.warnings),
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// Сохраняет выбранные дорожки в отдельный файл (mka/mks/mkv).
+pub fn run_extract(
+    info: &MediaInfo,
+    plan: &crate::extract::ExtractPlan,
+    tools: &ToolPaths,
+    cancel: Arc<AtomicBool>,
+    on_event: impl FnMut(ExecEvent),
+) -> Result<MuxOutcome> {
+    let prepared = crate::extract::prepare_extract(info, plan, tools)?;
+    run_prepared(prepared, info.duration_ms, cancel, on_event, |part| {
+        crate::verify::verify_extract(part, info, plan, tools)
+    })
+}
+
+fn run_prepared(
+    prepared: PreparedCommand,
+    duration_ms: Option<u64>,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(ExecEvent),
+    verify: impl FnOnce(&Path) -> Result<Vec<String>>,
+) -> Result<MuxOutcome> {
     let spec = prepared.spec;
     for warning in &prepared.warnings {
         on_event(ExecEvent::Warning(warning.clone()));
@@ -73,8 +102,6 @@ pub fn run_mux(
         spawn_reader(stderr, true, tx.clone());
     }
     drop(tx);
-
-    let duration_ms = info.duration_ms;
 
     let mut log: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = prepared.warnings.clone();
@@ -168,9 +195,9 @@ pub fn run_mux(
         ));
     }
 
-    match crate::verify::verify_output(&spec.output_part, info, plan, tools) {
-        Ok(report) => {
-            warnings.extend(report.warnings);
+    match verify(&spec.output_part) {
+        Ok(extra_warnings) => {
+            warnings.extend(extra_warnings);
         }
         Err(err) => {
             let _ = std::fs::remove_file(&spec.output_part);

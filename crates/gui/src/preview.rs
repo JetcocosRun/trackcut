@@ -8,13 +8,14 @@ use trackcut_core::preview::{extract_preview, preview_start_ms};
 use trackcut_core::{MediaInfo, ToolPaths};
 
 pub enum PreviewMsg {
-    Finished(usize),
-    Error(usize, String),
+    Finished(u64),
+    Error(u64, String),
 }
 
 #[derive(Default)]
 pub struct PreviewState {
-    pub uid: Option<usize>,
+    /// Уникальный ключ играющей дорожки (основной файл или внешний).
+    pub token: Option<u64>,
     pub stop: Option<Arc<AtomicBool>>,
     pub status: String,
 }
@@ -25,7 +26,7 @@ impl PreviewState {
             stop.store(true, Ordering::Relaxed);
         }
         self.stop = None;
-        self.uid = None;
+        self.token = None;
         self.status.clear();
     }
 }
@@ -34,7 +35,7 @@ impl PreviewState {
 pub fn start_preview(
     tools: ToolPaths,
     info: MediaInfo,
-    uid: usize,
+    token: u64,
     ff_index: usize,
     tx: Sender<PreviewMsg>,
 ) -> Arc<AtomicBool> {
@@ -45,23 +46,23 @@ pub fn start_preview(
         let temp: PathBuf = std::env::temp_dir().join(format!(
             "trackcut_preview_{}_{}.wav",
             std::process::id(),
-            uid
+            token
         ));
 
         let start = preview_start_ms(info.duration_ms);
         if let Err(err) = extract_preview(&tools, &info.path, ff_index, start, &temp) {
-            let _ = tx.send(PreviewMsg::Error(uid, err.to_string()));
+            let _ = tx.send(PreviewMsg::Error(token, err.to_string()));
             return;
         }
 
         match play_wav(&temp, &flag) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temp);
-                let _ = tx.send(PreviewMsg::Finished(uid));
+                let _ = tx.send(PreviewMsg::Finished(token));
             }
             Err(err) => {
                 let _ = std::fs::remove_file(&temp);
-                let _ = tx.send(PreviewMsg::Error(uid, err));
+                let _ = tx.send(PreviewMsg::Error(token, err));
             }
         }
     });

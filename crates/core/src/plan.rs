@@ -29,6 +29,35 @@ impl KeepTrack {
     }
 }
 
+/// Дорожка, которую берут из другого файла.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtraTrack {
+    /// Индекс дорожки в `ExtraInput::info.streams`.
+    pub uid: usize,
+    /// Сдвиг дорожки в миллисекундах: положительный — позже, отрицательный — раньше.
+    #[serde(default)]
+    pub delay_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtraInput {
+    /// Метаданные файла-источника (mka/mks/mkv или целый фильм).
+    pub info: MediaInfo,
+    pub tracks: Vec<ExtraTrack>,
+}
+
+impl ExtraInput {
+    pub fn streams(&self) -> impl Iterator<Item = &StreamInfo> {
+        self.tracks
+            .iter()
+            .filter_map(|track| self.info.streams.get(track.uid))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxPlan {
     pub input: PathBuf,
@@ -44,6 +73,9 @@ pub struct MuxPlan {
     pub overwrite: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<Backend>,
+    /// Файлы-источники дополнительных дорожек.
+    #[serde(default)]
+    pub extras: Vec<ExtraInput>,
 }
 
 impl MuxPlan {
@@ -65,6 +97,7 @@ impl MuxPlan {
             convert_subtitles_to_mov_text: false,
             overwrite: false,
             backend: None,
+            extras: Vec::new(),
         }
     }
 
@@ -73,6 +106,15 @@ impl MuxPlan {
             .iter()
             .filter_map(|entry| info.streams.get(entry.uid))
             .collect()
+    }
+
+    /// Все дорожки из внешних файлов.
+    pub fn extra_streams(&self) -> Vec<&StreamInfo> {
+        self.extras.iter().flat_map(ExtraInput::streams).collect()
+    }
+
+    pub fn has_extras(&self) -> bool {
+        self.extras.iter().any(|extra| !extra.tracks.is_empty())
     }
 
     pub fn is_kept(&self, uid: usize) -> bool {
@@ -146,6 +188,7 @@ fn resolve_backend(
         .keep
         .iter()
         .filter_map(|entry| info.streams.get(entry.uid))
+        .chain(plan.extra_streams())
         .all(|stream| stream.mkv_id.is_some());
 
     let requested = plan.backend.unwrap_or_else(|| {
@@ -243,17 +286,94 @@ pub fn validate(info: &MediaInfo, plan: &MuxPlan) -> Result<Vec<String>> {
     }
 
     let mut warnings = Vec::new();
-    let kept = plan.kept_streams(info);
+    validate_extras(plan, &mut warnings)?;
 
-    if !kept.iter().any(|s| s.kind == StreamKind::Video) {
+    let mut all_streams: Vec<&StreamInfo> = plan.kept_streams(info);
+    all_streams.extend(plan.extra_streams());
+
+    if !all_streams.iter().any(|s| s.kind == StreamKind::Video) {
         warnings.push("в выходе не останется видео".to_string());
     }
-    if !kept.iter().any(|s| s.kind == StreamKind::Audio) {
+    if !all_streams.iter().any(|s| s.kind == StreamKind::Audio) {
         warnings.push("в выходе не останется аудио".to_string());
     }
 
-    check_container_compatibility(info, plan, &kept, &mut warnings)?;
+    check_container_compatibility(info, plan, &all_streams, &mut warnings)?;
     Ok(warnings)
+}
+
+/// Проверяет файлы-источники дополнительных дорожек.
+fn validate_extras(plan: &MuxPlan, warnings: &mut Vec<String>) -> Result<()> {
+    if plan.extras.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen_paths: Vec<&Path> = Vec::new();
+    for extra in &plan.extras {
+        if extra.tracks.is_empty() {
+            continue;
+        }
+        if paths_equal(&extra.info.path, &plan.output) {
+            return Err(Error::InvalidPlan(
+                "выходной файл совпадает с файлом-источником внешней дорожки".to_string(),
+            ));
+        }
+        if seen_paths
+            .iter()
+            .any(|path| paths_equal(path, &extra.info.path))
+        {
+            return Err(Error::InvalidPlan(format!(
+                "файл «{}» добавлен дважды",
+                extra.info.path.display()
+            )));
+        }
+        seen_paths.push(&extra.info.path);
+
+        let mut seen_uids = std::collections::HashSet::new();
+        for track in &extra.tracks {
+            if !seen_uids.insert(track.uid) {
+                return Err(Error::InvalidPlan(format!(
+                    "дорожка {} из «{}» указана дважды",
+                    track.uid + 1,
+                    extra.info.path.display()
+                )));
+            }
+            let stream = extra.info.streams.get(track.uid).ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "в «{}» нет дорожки с индексом {}",
+                    extra.info.path.display(),
+                    track.uid
+                ))
+            })?;
+            if !stream.kind.is_selectable() {
+                return Err(Error::InvalidPlan(format!(
+                    "из «{}» нельзя взять дорожку «{}»: тип {}",
+                    extra.info.path.display(),
+                    stream.display_name(),
+                    stream.kind.label_ru()
+                )));
+            }
+        }
+
+        let delays: std::collections::BTreeSet<i64> =
+            extra.tracks.iter().map(|track| track.delay_ms).collect();
+        if delays.len() > 1 {
+            warnings.push(format!(
+                "в «{}» разные сдвиги у дорожек — для ffmpeg применится первый ({:+} мс)",
+                extra.info.path.display(),
+                extra.tracks[0].delay_ms
+            ));
+        }
+
+        if !extra.info.attachments.is_empty() && plan.keep_attachments {
+            warnings.push(format!(
+                "вложения из «{}» не переносятся — берутся только дорожки",
+                extra.info.path.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn check_container_compatibility(
@@ -392,16 +512,89 @@ fn mkvmerge_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<Os
         };
         if let Some(default) = entry.default {
             args.push("--default-track".into());
-            args.push(format!("{id}:{}", if default { "yes" } else { "no" }).into());
+            args.push(format!("{id}:{}", yes_no(default)).into());
         }
         if let Some(forced) = entry.forced {
             args.push("--forced-track".into());
-            args.push(format!("{id}:{}", if forced { "yes" } else { "no" }).into());
+            args.push(format!("{id}:{}", yes_no(forced)).into());
         }
     }
 
     args.push(info.path.clone().into_os_string());
+
+    for extra in &plan.extras {
+        if extra.tracks.is_empty() {
+            continue;
+        }
+        let selected: Vec<&StreamInfo> = extra.streams().collect();
+        let ids_for = |kind: StreamKind| -> Vec<String> {
+            selected
+                .iter()
+                .filter(|stream| stream.kind == kind)
+                .filter_map(|stream| stream.mkv_id)
+                .map(|id| id.to_string())
+                .collect()
+        };
+        let video = ids_for(StreamKind::Video);
+        let audio = ids_for(StreamKind::Audio);
+        let subtitles = ids_for(StreamKind::Subtitle);
+        if video.is_empty() {
+            args.push("-D".into());
+        } else {
+            args.push("-d".into());
+            args.push(video.join(",").into());
+        }
+        if audio.is_empty() {
+            args.push("-A".into());
+        } else {
+            args.push("-a".into());
+            args.push(audio.join(",").into());
+        }
+        if subtitles.is_empty() {
+            args.push("-S".into());
+        } else {
+            args.push("-s".into());
+            args.push(subtitles.join(",").into());
+        }
+        args.push("-B".into());
+        args.push("--no-chapters".into());
+        args.push("--no-global-tags".into());
+        args.push("--no-track-tags".into());
+        args.push("--no-attachments".into());
+
+        for track in &extra.tracks {
+            let Some(stream) = extra.info.streams.get(track.uid) else {
+                continue;
+            };
+            let Some(id) = stream.mkv_id else {
+                continue;
+            };
+            if track.delay_ms != 0 {
+                args.push("--sync".into());
+                args.push(format!("{id}:{}", track.delay_ms).into());
+            }
+            if let Some(default) = track.default {
+                args.push("--default-track".into());
+                args.push(format!("{id}:{}", yes_no(default)).into());
+            }
+            if let Some(forced) = track.forced {
+                args.push("--forced-track".into());
+                args.push(format!("{id}:{}", yes_no(forced)).into());
+            }
+        }
+
+        args.push(extra.info.path.clone().into_os_string());
+    }
+
     args
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn ffmpeg_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<OsString> {
@@ -410,6 +603,27 @@ fn ffmpeg_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<OsSt
         args.push(arg.into());
     }
     args.push(info.path.clone().into_os_string());
+
+    let extras: Vec<&ExtraInput> = plan
+        .extras
+        .iter()
+        .filter(|extra| !extra.tracks.is_empty())
+        .collect();
+
+    for extra in &extras {
+        // ffmpeg задаёт сдвиг на весь вход, поэтому берём первый ненулевой.
+        if let Some(delay) = extra
+            .tracks
+            .iter()
+            .map(|track| track.delay_ms)
+            .find(|d| *d != 0)
+        {
+            args.push("-itsoffset".into());
+            args.push(format!("{:.3}", delay as f64 / 1000.0).into());
+        }
+        args.push("-i".into());
+        args.push(extra.info.path.clone().into_os_string());
+    }
 
     let mut has_text_subtitles = false;
     for entry in &plan.keep {
@@ -424,6 +638,23 @@ fn ffmpeg_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<OsSt
         };
         args.push("-map".into());
         args.push(format!("0:{index}").into());
+    }
+
+    for (position, extra) in extras.iter().enumerate() {
+        let input_index = position + 1;
+        for track in &extra.tracks {
+            let Some(stream) = extra.info.streams.get(track.uid) else {
+                continue;
+            };
+            if stream.kind == StreamKind::Subtitle && stream.is_text_subtitle() {
+                has_text_subtitles = true;
+            }
+            let Some(index) = stream.ff_index else {
+                continue;
+            };
+            args.push("-map".into());
+            args.push(format!("{input_index}:{index}").into());
+        }
     }
 
     args.push("-c".into());
@@ -456,7 +687,7 @@ fn ffmpeg_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<OsSt
     args
 }
 
-fn part_path(output: &Path, extension: &str) -> PathBuf {
+pub(crate) fn part_path(output: &Path, extension: &str) -> PathBuf {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let stem = output
         .file_stem()
@@ -594,6 +825,7 @@ mod tests {
             convert_subtitles_to_mov_text: false,
             overwrite: true,
             backend: None,
+            extras: Vec::new(),
         }
     }
 
@@ -686,6 +918,61 @@ mod tests {
         let mut plan = plan(OutputContainer::Mkv, vec![0]);
         plan.input = PathBuf::from("video.mkv");
         plan.output = PathBuf::from("video.mkv");
+        let err = prepare(&info, &plan, &tools()).unwrap_err();
+        assert!(matches!(err, Error::InvalidPlan(_)), "{err:?}");
+    }
+
+    fn dub_extra(delay_ms: i64) -> ExtraInput {
+        ExtraInput {
+            info: MediaInfo {
+                path: PathBuf::from("dub.mka"),
+                duration_ms: Some(3_600_000),
+                streams: vec![stream(StreamKind::Audio, 0, 0, "A_AC3", "rus")],
+                ..Default::default()
+            },
+            tracks: vec![ExtraTrack {
+                uid: 0,
+                delay_ms,
+                default: Some(true),
+                forced: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn mkvmerge_attaches_tracks_from_another_file() {
+        let info = sample_info();
+        let mut plan = plan(OutputContainer::Mkv, vec![0]);
+        plan.extras.push(dub_extra(250));
+        let prepared = prepare(&info, &plan, &tools()).unwrap();
+        let line = command_line(&prepared);
+        assert_eq!(prepared.spec.backend, Backend::Mkvmerge);
+        assert!(line.contains("-a 0"), "{line}");
+        assert!(line.contains("--sync 0:250"), "{line}");
+        assert!(line.contains("--default-track 0:yes"), "{line}");
+        assert!(line.contains("--no-chapters"), "{line}");
+        assert!(line.contains("dub.mka"), "{line}");
+    }
+
+    #[test]
+    fn ffmpeg_maps_extra_inputs() {
+        let info = sample_info();
+        let mut plan = plan(OutputContainer::Mp4, vec![0]);
+        plan.backend = Some(Backend::Ffmpeg);
+        plan.extras.push(dub_extra(-120));
+        let prepared = prepare(&info, &plan, &tools()).unwrap();
+        let line = command_line(&prepared);
+        assert!(line.contains("-itsoffset -0.120"), "{line}");
+        assert!(line.contains("-i dub.mka"), "{line}");
+        assert!(line.contains("-map 1:0"), "{line}");
+    }
+
+    #[test]
+    fn output_must_differ_from_extra_source() {
+        let info = sample_info();
+        let mut plan = plan(OutputContainer::Mkv, vec![0]);
+        plan.extras.push(dub_extra(0));
+        plan.output = PathBuf::from("dub.mka");
         let err = prepare(&info, &plan, &tools()).unwrap_err();
         assert!(matches!(err, Error::InvalidPlan(_)), "{err:?}");
     }

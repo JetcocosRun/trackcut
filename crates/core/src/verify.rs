@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::extract::ExtractPlan;
 use crate::model::{MediaInfo, StreamKind};
 use crate::plan::MuxPlan;
 use crate::probe;
@@ -28,6 +29,13 @@ pub fn verify_output(
     for entry in &plan.keep {
         if let Some(stream) = input.streams.get(entry.uid) {
             *expected.entry(stream.kind).or_default() += 1;
+        }
+    }
+    for extra in &plan.extras {
+        for track in &extra.tracks {
+            if let Some(stream) = extra.info.streams.get(track.uid) {
+                *expected.entry(stream.kind).or_default() += 1;
+            }
         }
     }
     report.streams_expected = expected.values().sum();
@@ -90,4 +98,55 @@ pub fn verify_output(
     }
 
     Ok(report)
+}
+
+/// Проверяет, что в сохранённом файле ровно те дорожки, что просили.
+pub fn verify_extract(
+    output: &Path,
+    input: &MediaInfo,
+    plan: &ExtractPlan,
+    tools: &ToolPaths,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let info = match probe::probe(output, tools) {
+        Ok(info) => info,
+        Err(err) => {
+            warnings.push(format!(
+                "не удалось проверить извлечённую дорожку ({err}); файл создан, проверьте вручную"
+            ));
+            return Ok(warnings);
+        }
+    };
+
+    let mut expected: HashMap<StreamKind, usize> = HashMap::new();
+    for uid in &plan.tracks {
+        if let Some(stream) = input.streams.get(*uid) {
+            *expected.entry(stream.kind).or_default() += 1;
+        }
+    }
+
+    let mut actual: HashMap<StreamKind, usize> = HashMap::new();
+    for stream in &info.streams {
+        if stream.kind.is_selectable() {
+            *actual.entry(stream.kind).or_default() += 1;
+        }
+    }
+
+    for (kind, count) in &expected {
+        let found = actual.get(kind).copied().unwrap_or(0);
+        if found != *count {
+            return Err(Error::Verify(format!(
+                "{}: ожидалось дорожек {}, получено {}",
+                kind.label_ru(),
+                count,
+                found
+            )));
+        }
+    }
+
+    if expected.len() > 1 {
+        warnings.push("в файле несколько типов дорожек — проверьте, что взяли нужные".to_string());
+    }
+
+    Ok(warnings)
 }

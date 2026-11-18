@@ -6,9 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui::{self, Align, Color32, Layout, RichText};
+use trackcut_core::extract::{default_track_path, ExtractContainer, ExtractPlan};
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamInfo, StreamKind};
 use trackcut_core::plan::{paths_equal, validate};
-use trackcut_core::{probe, run_mux, Error, ExecEvent, KeepTrack, MediaInfo, MuxPlan, ToolPaths};
+use trackcut_core::{
+    probe, run_extract, run_mux, Error, ExecEvent, ExtraInput, ExtraTrack, KeepTrack, MediaInfo,
+    MuxPlan, ToolPaths,
+};
 
 use crate::preview::{start_preview, PreviewMsg, PreviewState};
 
@@ -51,6 +55,36 @@ enum Preset {
     Nothing,
 }
 
+#[derive(Clone)]
+struct ExtraTrackUi {
+    uid: usize,
+    delay_ms: i64,
+    default: bool,
+}
+
+#[derive(Clone)]
+struct ExtraSource {
+    info: MediaInfo,
+    tracks: Vec<ExtraTrackUi>,
+}
+
+impl ExtraSource {
+    fn name(&self) -> String {
+        self.info
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.info.path.display().to_string())
+    }
+}
+
+struct ExtraPick {
+    path: PathBuf,
+    info: Option<MediaInfo>,
+    error: Option<String>,
+    selected: Vec<bool>,
+}
+
 struct FileEntry {
     path: PathBuf,
     info: Option<MediaInfo>,
@@ -60,6 +94,7 @@ struct FileEntry {
     keep: Vec<bool>,
     default_flag: Vec<bool>,
     forced_flag: Vec<bool>,
+    extras: Vec<ExtraSource>,
     file_size: u64,
     result: Option<String>,
 }
@@ -76,6 +111,7 @@ impl FileEntry {
             keep: Vec::new(),
             default_flag: Vec::new(),
             forced_flag: Vec::new(),
+            extras: Vec::new(),
             file_size,
             result: None,
         }
@@ -106,6 +142,7 @@ impl FileEntry {
 
 enum ProbeMsg {
     Done(usize, Result<MediaInfo, String>),
+    ExtraPick(Result<MediaInfo, String>),
 }
 
 enum JobMsg {
@@ -122,6 +159,7 @@ enum JobMsg {
         ok: bool,
         message: String,
         output: Option<String>,
+        mark_result: bool,
     },
     AllDone {
         ok: usize,
@@ -166,11 +204,15 @@ impl Clone for JobState {
     }
 }
 
+enum JobOp {
+    Mux { info: MediaInfo, plan: MuxPlan },
+    Extract { info: MediaInfo, plan: ExtractPlan },
+}
+
 struct Job {
     file_index: usize,
     label: String,
-    info: MediaInfo,
-    plan: MuxPlan,
+    op: JobOp,
 }
 
 pub struct App {
@@ -194,6 +236,7 @@ pub struct App {
 
     filter: String,
     tags_open: Option<usize>,
+    extra_pick: Option<ExtraPick>,
 
     job: JobState,
     job_rx: Option<Receiver<JobMsg>>,
@@ -235,6 +278,7 @@ impl App {
             overwrite: false,
             filter: String::new(),
             tags_open: None,
+            extra_pick: None,
             job: JobState::Idle,
             job_rx: None,
             cancel: None,
@@ -334,7 +378,25 @@ impl App {
     fn poll_channels(&mut self, ctx: &egui::Context) {
         let probe_messages: Vec<ProbeMsg> = self.probe_rx.try_iter().collect();
         for message in probe_messages {
-            let ProbeMsg::Done(id, result) = message;
+            let (id, result) = match message {
+                ProbeMsg::Done(id, result) => (id, result),
+                ProbeMsg::ExtraPick(result) => {
+                    if let Some(pick) = &mut self.extra_pick {
+                        match result {
+                            Ok(info) => {
+                                pick.selected = default_extra_selection(&info);
+                                pick.info = Some(info);
+                                pick.error = None;
+                            }
+                            Err(err) => {
+                                pick.error = Some(err);
+                                pick.info = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
             self.probe_pending = self.probe_pending.saturating_sub(1);
             let Some(entry) = self.files.get_mut(id) else {
                 continue;
@@ -362,16 +424,16 @@ impl App {
         let preview_messages: Vec<PreviewMsg> = self.preview_rx.try_iter().collect();
         for message in preview_messages {
             match message {
-                PreviewMsg::Finished(uid) => {
-                    if self.preview.uid == Some(uid) {
-                        self.preview.uid = None;
+                PreviewMsg::Finished(token) => {
+                    if self.preview.token == Some(token) {
+                        self.preview.token = None;
                         self.preview.stop = None;
                         self.preview.status.clear();
                     }
                 }
-                PreviewMsg::Error(uid, err) => {
-                    if self.preview.uid == Some(uid) {
-                        self.preview.uid = None;
+                PreviewMsg::Error(token, err) => {
+                    if self.preview.token == Some(token) {
+                        self.preview.token = None;
                         self.preview.stop = None;
                     }
                     self.log.push(format!("Прослушивание: {err}"));
@@ -417,14 +479,15 @@ impl App {
                     ok,
                     message,
                     output,
+                    mark_result,
                 } => {
                     self.log.push(if ok {
                         format!("✔ {message}")
                     } else {
                         format!("✘ {message}")
                     });
-                    if let Some(entry) = self.files.get_mut(file_index) {
-                        if ok {
+                    if ok && mark_result {
+                        if let Some(entry) = self.files.get_mut(file_index) {
                             entry.result = output;
                         }
                     }
@@ -451,7 +514,7 @@ impl App {
             ctx.request_repaint();
         }
 
-        if self.probe_pending > 0 || self.is_busy() || self.preview.uid.is_some() {
+        if self.probe_pending > 0 || self.is_busy() || self.preview.token.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -512,6 +575,25 @@ impl App {
                 })
                 .collect();
 
+            let extras: Vec<ExtraInput> = entry
+                .extras
+                .iter()
+                .map(|extra| ExtraInput {
+                    info: extra.info.clone(),
+                    tracks: extra
+                        .tracks
+                        .iter()
+                        .map(|track| ExtraTrack {
+                            uid: track.uid,
+                            delay_ms: track.delay_ms,
+                            default: Some(track.default),
+                            forced: None,
+                        })
+                        .collect(),
+                })
+                .filter(|extra| !extra.tracks.is_empty())
+                .collect();
+
             let plan = MuxPlan {
                 input: entry.path.clone(),
                 output,
@@ -523,14 +605,14 @@ impl App {
                 convert_subtitles_to_mov_text: self.mov_text,
                 overwrite: self.overwrite,
                 backend: None,
+                extras,
             };
 
             validate(&info, &plan).map_err(|err| format!("{}: {err}", entry.name()))?;
             jobs.push(Job {
                 file_index,
                 label: entry.name(),
-                info,
-                plan,
+                op: JobOp::Mux { info, plan },
             });
         }
 
@@ -551,7 +633,19 @@ impl App {
                 return;
             }
         };
+        let total = jobs.len();
+        self.start_jobs(jobs, format!("Сборка: {total} файл(ов)"));
+    }
 
+    fn start_extract(&mut self, job: Job) {
+        if self.is_busy() {
+            return;
+        }
+        let status = format!("Извлечение: {}", job.label);
+        self.start_jobs(vec![job], status);
+    }
+
+    fn start_jobs(&mut self, jobs: Vec<Job>, status: String) {
         let total = jobs.len();
         let first_name = jobs[0].label.clone();
         let (tx, rx) = mpsc::channel();
@@ -565,7 +659,7 @@ impl App {
             percent: 0.0,
         };
         self.log.clear();
-        self.status = format!("Сборка: {total} файл(ов)");
+        self.status = status;
 
         let tools = self.tools.clone();
         std::thread::spawn(move || {
@@ -582,41 +676,47 @@ impl App {
                 });
 
                 let events = tx.clone();
-                let result =
-                    run_mux(
-                        &job.info,
-                        &job.plan,
-                        &tools,
-                        cancel.clone(),
-                        |event| match event {
-                            ExecEvent::Progress(percent) => {
-                                let _ = events.send(JobMsg::Progress(percent));
-                            }
-                            ExecEvent::Warning(warning) => {
-                                let _ = events.send(JobMsg::Warning(warning));
-                            }
-                            ExecEvent::Message(message) => {
-                                let _ = events.send(JobMsg::Message(message));
-                            }
-                        },
-                    );
+                let forward = |event: ExecEvent| match event {
+                    ExecEvent::Progress(percent) => {
+                        let _ = events.send(JobMsg::Progress(percent));
+                    }
+                    ExecEvent::Warning(warning) => {
+                        let _ = events.send(JobMsg::Warning(warning));
+                    }
+                    ExecEvent::Message(message) => {
+                        let _ = events.send(JobMsg::Message(message));
+                    }
+                };
+
+                let is_extract = matches!(job.op, JobOp::Extract { .. });
+                let result = match &job.op {
+                    JobOp::Mux { info, plan } => {
+                        run_mux(info, plan, &tools, cancel.clone(), forward)
+                    }
+                    JobOp::Extract { info, plan } => {
+                        run_extract(info, plan, &tools, cancel.clone(), forward)
+                    }
+                };
 
                 match result {
                     Ok(outcome) => {
                         ok += 1;
+                        let name = outcome
+                            .output
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let message = if is_extract {
+                            format!("{}: сохранено в {name}", job.label)
+                        } else {
+                            format!("{} → {name}", job.label)
+                        };
                         let _ = tx.send(JobMsg::FileDone {
                             file_index: job.file_index,
                             ok: true,
-                            message: format!(
-                                "{} → {}",
-                                job.label,
-                                outcome
-                                    .output
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().to_string())
-                                    .unwrap_or_default()
-                            ),
+                            message,
                             output: Some(outcome.output.display().to_string()),
+                            mark_result: !is_extract,
                         });
                     }
                     Err(Error::Cancelled) => break,
@@ -627,6 +727,7 @@ impl App {
                             ok: false,
                             message: format!("{}: {err}", job.label),
                             output: None,
+                            mark_result: false,
                         });
                     }
                 }
@@ -643,7 +744,8 @@ impl App {
     }
 
     fn preview_stream(&mut self, uid: usize) {
-        if self.preview.uid == Some(uid) {
+        let token = main_token(uid);
+        if self.preview.token == Some(token) {
             self.preview.stop();
             return;
         }
@@ -655,6 +757,29 @@ impl App {
         let Some(info) = entry.info.clone() else {
             return;
         };
+        self.play_preview(info, uid, token);
+    }
+
+    /// Прослушивание дорожки, взятой из другого файла.
+    fn preview_extra(&mut self, source: usize, uid: usize) {
+        let token = extra_token(source, uid);
+        if self.preview.token == Some(token) {
+            self.preview.stop();
+            return;
+        }
+        self.preview.stop();
+
+        let Some(entry) = self.files.get(self.selected) else {
+            return;
+        };
+        let Some(extra) = entry.extras.get(source) else {
+            return;
+        };
+        let info = extra.info.clone();
+        self.play_preview(info, uid, token);
+    }
+
+    fn play_preview(&mut self, info: MediaInfo, uid: usize, token: u64) {
         let Some(stream) = info.streams.get(uid) else {
             return;
         };
@@ -670,13 +795,103 @@ impl App {
         let stop = start_preview(
             self.tools.clone(),
             info,
-            uid,
+            token,
             ff_index,
             self.preview_tx.clone(),
         );
-        self.preview.uid = Some(uid);
+        self.preview.token = Some(token);
         self.preview.stop = Some(stop);
         self.preview.status = "Играет фрагмент…".to_string();
+    }
+
+    /// Сохраняет одну дорожку текущего файла в mka/mks/mkv.
+    fn extract_track(&mut self, uid: usize) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(entry) = self.files.get(self.selected) else {
+            return;
+        };
+        let Some(info) = entry.info.clone() else {
+            return;
+        };
+        let Some(stream) = info.streams.get(uid).cloned() else {
+            return;
+        };
+        let label = entry.name();
+
+        let default = default_track_path(&info.path, &[&stream]);
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(
+                default
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "track.mka".to_string()),
+            )
+            .add_filter("Дорожка", &["mka", "mks", "mkv"])
+            .add_filter("Аудио (MKA)", &["mka"])
+            .add_filter("Субтитры (MKS)", &["mks"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let container = path
+            .extension()
+            .and_then(|ext| ExtractContainer::from_extension(&ext.to_string_lossy()))
+            .unwrap_or_else(|| ExtractContainer::for_streams(&[&stream]));
+        let output = if path.extension().is_none() {
+            path.with_extension(container.extension())
+        } else {
+            path
+        };
+
+        let plan = ExtractPlan {
+            input: info.path.clone(),
+            output,
+            tracks: vec![uid],
+            container,
+            overwrite: self.overwrite,
+            backend: None,
+        };
+        self.start_extract(Job {
+            file_index: self.selected,
+            label: format!("{label} · дорожка {}", uid + 1),
+            op: JobOp::Extract { info, plan },
+        });
+    }
+
+    /// Открывает диалог выбора файла-источника внешней дорожки.
+    fn pick_extra_file(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Видео и дорожки",
+                &[
+                    "mkv", "mka", "mks", "mp4", "m4v", "mov", "webm", "avi", "ts", "m2ts", "mpg",
+                    "mpeg", "ac3", "eac3", "dts", "flac", "aac", "m4a", "ogg", "opus", "srt",
+                    "ass",
+                ],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.extra_pick = Some(ExtraPick {
+            path: path.clone(),
+            info: None,
+            error: None,
+            selected: Vec::new(),
+        });
+        let tx = self.probe_tx.clone();
+        let tools = self.tools.clone();
+        std::thread::spawn(move || {
+            let result = probe::probe(&path, &tools).map_err(|err| err.to_string());
+            let _ = tx.send(ProbeMsg::ExtraPick(result));
+        });
     }
 
     fn apply_preset(&mut self, preset: Preset) {
@@ -782,6 +997,7 @@ impl eframe::App for App {
         self.show_bottom(ctx);
         self.show_center(ctx);
         self.show_tags(ctx);
+        self.show_extra_picker(ctx);
         self.show_drop_overlay(ctx);
     }
 }
@@ -1141,10 +1357,15 @@ impl App {
                 self.selected = self.files.len() - 1;
             }
 
-            let preview_uid = self.preview.uid;
+            let preview_token = self.preview.token;
+            let busy = self.is_busy();
             let mut preset_action: Option<Preset> = None;
             let mut preview_request: Option<usize> = None;
             let mut tags_request: Option<usize> = None;
+            let mut extract_request: Option<usize> = None;
+            let mut extra_preview: Option<(usize, usize)> = None;
+            let mut extra_remove: Option<(usize, usize)> = None;
+            let mut extra_pick = false;
             let mut apply_all = false;
 
             let file_size;
@@ -1252,20 +1473,21 @@ impl App {
                 });
 
                 ui.add_space(4.0);
+                let table_height = (ui.available_height() - 190.0).max(150.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     egui::ScrollArea::both()
                         .id_salt("tracks")
                         .auto_shrink([false, false])
-                        .max_height(ui.available_height() - 8.0)
+                        .max_height(table_height)
                         .show(ui, |ui| {
                             egui::Grid::new("track_grid")
                                 .striped(true)
-                                .num_columns(12)
+                                .num_columns(13)
                                 .spacing([10.0, 6.0])
                                 .show(ui, |ui| {
                                     for header in [
                                         "", "Тип", "№", "Кодек", "Язык", "Название",
-                                        "Параметры", "Размер", "Def", "Forced", "", "",
+                                        "Параметры", "Размер", "Def", "Forced", "⤓", "", "",
                                     ] {
                                         ui.label(RichText::new(header).strong().small());
                                     }
@@ -1367,9 +1589,25 @@ impl App {
                                         );
 
                                         if stream.kind == StreamKind::Audio
+                                            || stream.kind == StreamKind::Subtitle
+                                        {
+                                            let response = ui
+                                                .add_enabled(!busy, egui::Button::new("⤓").small())
+                                                .on_hover_text(
+                                                    "Сохранить эту дорожку отдельно (MKA/MKS), \
+                                                     чтобы потом пришить к другому файлу",
+                                                );
+                                            if response.clicked() {
+                                                extract_request = Some(uid);
+                                            }
+                                        } else {
+                                            ui.label("");
+                                        }
+
+                                        if stream.kind == StreamKind::Audio
                                             && stream.ff_index.is_some()
                                         {
-                                            let playing = preview_uid == Some(uid);
+                                            let playing = preview_token == Some(main_token(uid));
                                             let label = if playing { "■" } else { "▶" };
                                             let response = ui
                                                 .add(egui::Button::new(label).small())
@@ -1412,6 +1650,127 @@ impl App {
                         "Для MP4 текст субтитров нужно конвертировать в MOV text — включите опцию слева.",
                     );
                 }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Дорожки из других файлов").strong());
+                    let extra_count: usize =
+                        entry.extras.iter().map(|extra| extra.tracks.len()).sum();
+                    if extra_count > 0 {
+                        ui.label(
+                            RichText::new(format!("+{extra_count}"))
+                                .color(GREEN)
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("＋ Взять из файла…"))
+                            .on_hover_text("Пришить аудио или субтитры из другого релиза")
+                            .clicked()
+                        {
+                            extra_pick = true;
+                        }
+                    });
+                });
+
+                if entry.extras.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Например, озвучка из другого релиза: дорожка скопируется \
+                             в результат без перекодирования. Сдвиг в мс поправит рассинхрон.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("extras_scroll")
+                        .max_height(152.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                    for (source_index, extra) in entry.extras.iter_mut().enumerate() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("📄 {}", truncate_chars(&extra.name(), 44)))
+                                    .color(ACCENT)
+                                    .small(),
+                            )
+                            .on_hover_text(extra.info.path.display().to_string());
+                            ui.label(
+                                RichText::new(format!("дорожек: {}", extra.tracks.len()))
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        });
+
+                        for (track_index, track) in extra.tracks.iter_mut().enumerate() {
+                            let stream = extra.info.streams.get(track.uid).cloned();
+                            ui.horizontal(|ui| {
+                                let Some(stream) = &stream else {
+                                    ui.label(
+                                        RichText::new("дорожка не найдена в файле")
+                                            .color(RED)
+                                            .small(),
+                                    );
+                                    return;
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        stream.kind.icon(),
+                                        stream.kind.label_ru()
+                                    ))
+                                    .color(kind_color(stream.kind))
+                                    .small(),
+                                );
+                                ui.label(RichText::new(stream.codec_display()).small());
+                                ui.label(
+                                    RichText::new(truncate_chars(
+                                        &trackcut_core::extract::track_caption(stream),
+                                        46,
+                                    ))
+                                    .small(),
+                                );
+                                ui.label(RichText::new("сдвиг").small().color(MUTED));
+                                ui.add(
+                                    egui::DragValue::new(&mut track.delay_ms)
+                                        .speed(10.0)
+                                        .range(-600_000..=600_000)
+                                        .suffix(" мс"),
+                                )
+                                .on_hover_text(
+                                    "Положительное значение — дорожка зазвучит позже",
+                                );
+                                ui.checkbox(&mut track.default, "Def").on_hover_text(
+                                    "Пометить дорожку как выбранную по умолчанию",
+                                );
+                                if stream.kind == StreamKind::Audio && stream.ff_index.is_some() {
+                                    let playing = preview_token
+                                        == Some(extra_token(source_index, track.uid));
+                                    let label = if playing { "■" } else { "▶" };
+                                    if ui
+                                        .add(egui::Button::new(label).small())
+                                        .on_hover_text("Прослушать 15 секунд")
+                                        .clicked()
+                                    {
+                                        extra_preview = Some((source_index, track_index));
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("✕").small())
+                                    .on_hover_text("Убрать дорожку из результата")
+                                    .clicked()
+                                {
+                                    extra_remove = Some((source_index, track_index));
+                                }
+                            });
+                        }
+                    }
+                        });
+                }
             }
 
             if let Some(preset) = preset_action {
@@ -1425,6 +1784,26 @@ impl App {
             }
             if let Some(uid) = tags_request {
                 self.open_tags(uid);
+            }
+            if let Some(uid) = extract_request {
+                self.extract_track(uid);
+            }
+            if extra_pick {
+                self.pick_extra_file();
+            }
+            if let Some((source, track)) = extra_remove {
+                if let Some(entry) = self.files.get_mut(self.selected) {
+                    if let Some(extra) = entry.extras.get_mut(source) {
+                        if track < extra.tracks.len() {
+                            extra.tracks.remove(track);
+                        }
+                    }
+                    entry.extras.retain(|extra| !extra.tracks.is_empty());
+                }
+                self.status = "Внешняя дорожка убрана".to_string();
+            }
+            if let Some((source, uid)) = extra_preview {
+                self.preview_extra(source, uid);
             }
         });
     }
@@ -1497,10 +1876,10 @@ impl App {
 
                 ui.label(RichText::new(self.status.clone()).color(MUTED).small());
 
-                if let Some(uid) = self.preview.uid {
+                if self.preview.token.is_some() {
                     ui.separator();
                     ui.label(
-                        RichText::new(format!("прослушивание: дорожка №{}", uid + 1))
+                        RichText::new("прослушивание включено")
                             .color(ACCENT)
                             .small(),
                     );
@@ -1622,6 +2001,185 @@ impl App {
         }
     }
 
+    fn show_extra_picker(&mut self, ctx: &egui::Context) {
+        let Some(mut pick) = self.extra_pick.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut add = false;
+        let mut close = false;
+
+        egui::Window::new("Взять дорожку из другого файла")
+            .open(&mut open)
+            .default_width(780.0)
+            .default_height(460.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(pick.path.display().to_string())
+                        .small()
+                        .color(MUTED),
+                );
+                ui.add_space(4.0);
+
+                if let Some(err) = &pick.error {
+                    ui.colored_label(RED, format!("Не удалось прочитать файл: {err}"));
+                    ui.label(
+                        RichText::new(
+                            "Нужны ffprobe или mkvmerge: папка tools рядом с программой или PATH.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    return;
+                }
+
+                let Some(info) = pick.info.clone() else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Читаю дорожки…").color(MUTED));
+                    });
+                    return;
+                };
+
+                if pick.selected.len() != info.streams.len() {
+                    pick.selected = default_extra_selection(&info);
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("extra_pick_scroll")
+                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("extra_pick_grid")
+                            .num_columns(6)
+                            .striped(true)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                for header in ["", "Тип", "Кодек", "Язык", "Название", "Параметры"]
+                                {
+                                    ui.label(RichText::new(header).strong().small());
+                                }
+                                ui.end_row();
+
+                                for (uid, stream) in info.streams.iter().enumerate() {
+                                    let selectable = stream.kind.is_selectable();
+                                    ui.add_enabled(
+                                        selectable,
+                                        egui::Checkbox::without_text(&mut pick.selected[uid]),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            stream.kind.icon(),
+                                            stream.kind.label_ru()
+                                        ))
+                                        .color(kind_color(stream.kind))
+                                        .small(),
+                                    );
+                                    ui.label(stream.codec_display());
+                                    ui.label(stream.language_label());
+                                    ui.label(truncate_chars(stream.display_name(), 34));
+                                    ui.label(
+                                        RichText::new(params_for(stream)).small().color(MUTED),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("Только аудио").clicked() {
+                        for (uid, stream) in info.streams.iter().enumerate() {
+                            pick.selected[uid] = stream.kind == StreamKind::Audio;
+                        }
+                    }
+                    if ui.small_button("Снять все").clicked() {
+                        pick.selected.iter_mut().for_each(|value| *value = false);
+                    }
+                    let chosen = pick.selected.iter().filter(|value| **value).count();
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("выбрано: {chosen}"))
+                            .small()
+                            .color(MUTED),
+                    );
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let chosen = pick.selected.iter().filter(|value| **value).count();
+                    if ui
+                        .add_enabled(
+                            chosen > 0,
+                            egui::Button::new(RichText::new("Добавить").strong()),
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if add {
+            let Some(info) = pick.info.clone() else {
+                self.extra_pick = Some(pick);
+                return;
+            };
+            let tracks: Vec<ExtraTrackUi> = info
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(uid, stream)| {
+                    pick.selected.get(*uid).copied().unwrap_or(false) && stream.kind.is_selectable()
+                })
+                .map(|(uid, _)| ExtraTrackUi {
+                    uid,
+                    delay_ms: 0,
+                    default: false,
+                })
+                .collect();
+
+            if tracks.is_empty() {
+                self.status = "Ничего не выбрано".to_string();
+                self.extra_pick = Some(pick);
+                return;
+            }
+
+            if let Some(entry) = self.files.get_mut(self.selected) {
+                if let Some(existing) = entry
+                    .extras
+                    .iter_mut()
+                    .find(|extra| paths_equal(&extra.info.path, &info.path))
+                {
+                    for track in tracks {
+                        if !existing.tracks.iter().any(|item| item.uid == track.uid) {
+                            existing.tracks.push(track);
+                        }
+                    }
+                } else {
+                    entry.extras.push(ExtraSource {
+                        info: info.clone(),
+                        tracks,
+                    });
+                }
+                let added: usize = entry.extras.iter().map(|extra| extra.tracks.len()).sum();
+                self.status = format!("Внешних дорожек: {added}");
+            }
+            return;
+        }
+
+        if close || !open {
+            return;
+        }
+        self.extra_pick = Some(pick);
+    }
+
     fn show_drop_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
         if !hovering || self.is_busy() {
@@ -1641,6 +2199,32 @@ impl App {
             Color32::WHITE,
         );
     }
+}
+
+/// Ключ прослушивания дорожки основного файла.
+fn main_token(uid: usize) -> u64 {
+    uid as u64
+}
+
+/// Ключ прослушивания внешней дорожки (файл + номер дорожки).
+fn extra_token(source: usize, uid: usize) -> u64 {
+    (1u64 << 40) + source as u64 * 1000 + uid as u64
+}
+
+/// Что отметить по умолчанию при выборе внешнего файла.
+fn default_extra_selection(info: &MediaInfo) -> Vec<bool> {
+    let has_audio = info
+        .streams
+        .iter()
+        .any(|stream| stream.kind == StreamKind::Audio);
+    info.streams
+        .iter()
+        .map(|stream| match stream.kind {
+            StreamKind::Audio => has_audio,
+            StreamKind::Subtitle => !has_audio,
+            _ => false,
+        })
+        .collect()
 }
 
 fn params_for(stream: &StreamInfo) -> String {

@@ -3,8 +3,11 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use trackcut_core::extract::{ExtractContainer, ExtractPlan};
 use trackcut_core::model::{OutputContainer, StreamKind};
-use trackcut_core::{probe, run_mux, KeepTrack, MediaInfo, MuxPlan, ToolPaths};
+use trackcut_core::{
+    probe, run_extract, run_mux, ExtraInput, ExtraTrack, KeepTrack, MediaInfo, MuxPlan, ToolPaths,
+};
 
 fn tools() -> Option<ToolPaths> {
     let tools = ToolPaths::detect();
@@ -180,6 +183,7 @@ fn removes_unwanted_audio_and_subtitles_without_reencoding() {
         convert_subtitles_to_mov_text: false,
         overwrite: true,
         backend: None,
+        extras: Vec::new(),
     };
 
     let outcome = run_mux(
@@ -241,6 +245,7 @@ fn remuxes_to_mp4_with_ffmpeg() {
         convert_subtitles_to_mov_text: false,
         overwrite: true,
         backend: None,
+        extras: Vec::new(),
     };
 
     let outcome = run_mux(
@@ -263,6 +268,125 @@ fn ffprobe_stream_count(path: &Path) -> usize {
     let tools = ToolPaths::detect();
     let info = probe::probe(path, &tools).unwrap();
     info.streams.len()
+}
+
+#[test]
+fn extracts_audio_then_attaches_it_to_another_file() {
+    let Some(tools) = tools() else {
+        eprintln!("пропуск: ffmpeg/ffprobe не найдены");
+        return;
+    };
+    let dir = workdir("attach");
+    let input = make_fixture(&tools, &dir);
+    let info = probe::probe(&input, &tools).expect("probe исходника");
+    let eng_audio = find_stream(&info, StreamKind::Audio, "eng");
+
+    // 1. Сохраняем английскую дорожку отдельным файлом.
+    let track_file = dir.join("eng.mka");
+    let extract_plan = ExtractPlan {
+        input: input.clone(),
+        output: track_file.clone(),
+        tracks: vec![eng_audio],
+        container: ExtractContainer::Mka,
+        overwrite: true,
+        backend: None,
+    };
+    run_extract(
+        &info,
+        &extract_plan,
+        &tools,
+        Arc::new(AtomicBool::new(false)),
+        |_event| {},
+    )
+    .expect("извлечение дорожки");
+
+    let track_info = probe::probe(&track_file, &tools).expect("probe mka");
+    assert_eq!(track_info.kind_count(StreamKind::Audio), 1);
+    assert_eq!(track_info.kind_count(StreamKind::Video), 0);
+    assert_eq!(
+        track_info.streams[0]
+            .language
+            .as_deref()
+            .map(str::to_ascii_lowercase),
+        Some("eng".to_string()),
+        "язык должен пережить извлечение"
+    );
+
+    // 2. Делаем «второй релиз»: только видео, без звука.
+    let video_only = dir.join("video_only.mkv");
+    run(
+        &tools.ffmpeg().unwrap(),
+        &[
+            "-hide_banner",
+            "-y",
+            "-i",
+            input.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-c",
+            "copy",
+            "-an",
+            "-sn",
+            video_only.to_str().unwrap(),
+        ],
+    );
+    let video_info = probe::probe(&video_only, &tools).expect("probe видео");
+    assert_eq!(video_info.kind_count(StreamKind::Audio), 0);
+
+    let keep = video_info
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| stream.kind == StreamKind::Video)
+        .map(|(uid, _)| KeepTrack::new(uid))
+        .collect();
+
+    let output = dir.join("attached.mkv");
+    let plan = MuxPlan {
+        input: video_only.clone(),
+        output: output.clone(),
+        container: OutputContainer::Mkv,
+        keep,
+        keep_chapters: true,
+        keep_tags: true,
+        keep_attachments: true,
+        convert_subtitles_to_mov_text: false,
+        overwrite: true,
+        backend: None,
+        extras: vec![ExtraInput {
+            info: track_info,
+            tracks: vec![ExtraTrack {
+                uid: 0,
+                delay_ms: 0,
+                default: Some(true),
+                forced: None,
+            }],
+        }],
+    };
+
+    let outcome = run_mux(
+        &video_info,
+        &plan,
+        &tools,
+        Arc::new(AtomicBool::new(false)),
+        |_event| {},
+    )
+    .expect("пришивание дорожки");
+
+    let result = probe::probe(&outcome.output, &tools).expect("probe результата");
+    assert_eq!(result.kind_count(StreamKind::Video), 1);
+    assert_eq!(result.kind_count(StreamKind::Audio), 1);
+    let audio = result
+        .streams
+        .iter()
+        .find(|stream| stream.kind == StreamKind::Audio)
+        .unwrap();
+    assert_eq!(
+        audio.language.as_deref().map(str::to_ascii_lowercase),
+        Some("eng".to_string())
+    );
+    assert!(audio.default, "дорожка должна стать default");
+    assert!(outcome.output.exists());
 }
 
 #[test]
