@@ -8,7 +8,8 @@ use trackcut_core::extract::{default_track_path, prepare_extract, ExtractContain
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamKind};
 use trackcut_core::plan::{default_output_path, paths_equal, prepare};
 use trackcut_core::{
-    probe, run_extract, run_mux, ExecEvent, ExtraInput, ExtraTrack, MediaInfo, MuxPlan, ToolPaths,
+    estimate_delay, probe, run_extract, run_mux, ExecEvent, ExtraInput, ExtraTrack, MediaInfo,
+    MuxPlan, ToolPaths,
 };
 
 #[derive(Parser)]
@@ -96,6 +97,19 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Подобрать сдвиг внешней дорожки по звуку.
+    Sync {
+        /// Основной файл (с эталонной аудиодорожкой).
+        input: PathBuf,
+        /// Файл с внешней дорожкой.
+        extra: PathBuf,
+        /// Дорожка основного файла (номер из probe). По умолчанию первая аудио.
+        #[arg(long)]
+        main_track: Option<usize>,
+        /// Дорожка внешнего файла (номер из probe). По умолчанию первая аудио.
+        #[arg(long)]
+        extra_track: Option<usize>,
+    },
 }
 
 fn main() {
@@ -151,11 +165,83 @@ fn main() {
             overwrite,
             dry_run,
         ),
+        Command::Sync {
+            input,
+            extra,
+            main_track,
+            extra_track,
+        } => cmd_sync(&tools, &input, &extra, main_track, extra_track),
     };
 
     if let Err(err) = result {
         eprintln!("Ошибка: {err}");
         std::process::exit(1);
+    }
+}
+
+fn cmd_sync(
+    tools: &ToolPaths,
+    input: &Path,
+    extra: &Path,
+    main_track: Option<usize>,
+    extra_track: Option<usize>,
+) -> Result<(), String> {
+    let main_info = probe::probe(input, tools).map_err(|err| err.to_string())?;
+    let extra_info = probe::probe(extra, tools).map_err(|err| err.to_string())?;
+
+    let main_uid = pick_audio_uid(&main_info, main_track, "основном файле")?;
+    let extra_uid = pick_audio_uid(&extra_info, extra_track, "внешнем файле")?;
+
+    eprintln!(
+        "Сравниваю «{}» (дорожка {}) и «{}» (дорожка {})…",
+        input.display(),
+        main_uid + 1,
+        extra.display(),
+        extra_uid + 1
+    );
+    let estimate = estimate_delay(tools, &main_info, main_uid, &extra_info, extra_uid)
+        .map_err(|err| err.to_string())?;
+
+    let sign = if estimate.delay_ms > 0 { "+" } else { "" };
+    println!("Сдвиг: {sign}{} мс", estimate.delay_ms);
+    println!(
+        "Совпало окон: {}/{} · совпадение {:.0}%",
+        estimate.windows_agree,
+        estimate.windows_total,
+        estimate.score.max(0.0) * 100.0
+    );
+    println!(
+        "Подсказка: --add \"{}\" --add-delay {}",
+        extra.display(),
+        estimate.delay_ms
+    );
+    for warning in &estimate.warnings {
+        eprintln!("Предупреждение: {warning}");
+    }
+    Ok(())
+}
+
+/// Номер дорожки из probe (с 1) или первая аудио, если номер не задан.
+fn pick_audio_uid(info: &MediaInfo, display: Option<usize>, where_: &str) -> Result<usize, String> {
+    match display {
+        Some(display) => {
+            let uid = display
+                .checked_sub(1)
+                .ok_or_else(|| format!("номера дорожек начинаются с 1, получено {display}"))?;
+            let stream = info
+                .streams
+                .get(uid)
+                .ok_or_else(|| format!("в {where_} нет дорожки №{display}"))?;
+            if stream.kind != StreamKind::Audio {
+                return Err(format!("дорожка №{display} в {where_} — не аудио"));
+            }
+            Ok(uid)
+        }
+        None => info
+            .streams
+            .iter()
+            .position(|stream| stream.kind == StreamKind::Audio && stream.ff_index.is_some())
+            .ok_or_else(|| format!("в {where_} нет аудиодорожки для сравнения")),
     }
 }
 

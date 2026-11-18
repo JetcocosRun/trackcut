@@ -6,7 +6,8 @@ use std::sync::Arc;
 use trackcut_core::extract::{ExtractContainer, ExtractPlan};
 use trackcut_core::model::{OutputContainer, StreamKind};
 use trackcut_core::{
-    probe, run_extract, run_mux, ExtraInput, ExtraTrack, KeepTrack, MediaInfo, MuxPlan, ToolPaths,
+    estimate_delay, probe, run_extract, run_mux, ExtraInput, ExtraTrack, KeepTrack, MediaInfo,
+    MuxPlan, ToolPaths,
 };
 
 fn tools() -> Option<ToolPaths> {
@@ -387,6 +388,85 @@ fn extracts_audio_then_attaches_it_to_another_file() {
     );
     assert!(audio.default, "дорожка должна стать default");
     assert!(outcome.output.exists());
+}
+
+#[test]
+fn estimates_delay_between_two_encodes_of_the_same_audio() {
+    let Some(tools) = tools() else {
+        eprintln!("пропуск: ffmpeg/ffprobe не найдены");
+        return;
+    };
+    let dir = workdir("sync");
+    let ffmpeg = tools.ffmpeg().unwrap();
+
+    // Один и тот же шум, но вторая дорожка задержана на 400 мс.
+    let wav = dir.join("noise.wav");
+    run(
+        &ffmpeg,
+        &[
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=30:color=pink:amplitude=0.3",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            wav.to_str().unwrap(),
+        ],
+    );
+
+    let main = dir.join("main.mka");
+    run(
+        &ffmpeg,
+        &[
+            "-hide_banner",
+            "-y",
+            "-i",
+            wav.to_str().unwrap(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            main.to_str().unwrap(),
+        ],
+    );
+
+    let extra = dir.join("extra.mka");
+    run(
+        &ffmpeg,
+        &[
+            "-hide_banner",
+            "-y",
+            "-i",
+            wav.to_str().unwrap(),
+            "-af",
+            "adelay=400",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            extra.to_str().unwrap(),
+        ],
+    );
+
+    let main_info = probe::probe(&main, &tools).expect("probe основной дорожки");
+    let extra_info = probe::probe(&extra, &tools).expect("probe внешней дорожки");
+    let estimate = estimate_delay(&tools, &main_info, 0, &extra_info, 0).expect("подбор сдвига");
+
+    assert!(
+        (estimate.delay_ms + 400).abs() <= 20,
+        "ожидали -400 мс, получили {} мс (score={})",
+        estimate.delay_ms,
+        estimate.score
+    );
+    assert!(
+        estimate.score > 0.4,
+        "слабое совпадение: {}",
+        estimate.score
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ pub mod model;
 pub mod plan;
 pub mod preview;
 pub mod probe;
+pub mod sync;
 pub mod tools;
 pub mod verify;
 
@@ -21,5 +22,6 @@ pub use plan::{
     default_output_path, paths_equal, prepare, validate, CommandSpec, ExtraInput, ExtraTrack,
     KeepTrack, MuxPlan, PreparedCommand,
 };
+pub use sync::{estimate_delay, OffsetEstimate};
 pub use tools::ToolPaths;
 pub use verify::{verify_extract, verify_output, VerifyReport};

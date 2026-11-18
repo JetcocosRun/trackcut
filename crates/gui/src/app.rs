@@ -10,8 +10,8 @@ use trackcut_core::extract::{default_track_path, ExtractContainer, ExtractPlan};
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamInfo, StreamKind};
 use trackcut_core::plan::{paths_equal, validate};
 use trackcut_core::{
-    probe, run_extract, run_mux, Error, ExecEvent, ExtraInput, ExtraTrack, KeepTrack, MediaInfo,
-    MuxPlan, ToolPaths,
+    estimate_delay, probe, run_extract, run_mux, Error, ExecEvent, ExtraInput, ExtraTrack,
+    KeepTrack, MediaInfo, MuxPlan, OffsetEstimate, ToolPaths,
 };
 
 use crate::preview::{start_preview, PreviewMsg, PreviewState};
@@ -60,6 +60,10 @@ struct ExtraTrackUi {
     uid: usize,
     delay_ms: i64,
     default: bool,
+    /// Идёт подбор сдвига по звуку.
+    syncing: bool,
+    /// Результат подбора: «совпало 3/3 окон» или текст ошибки.
+    sync_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -143,6 +147,11 @@ impl FileEntry {
 enum ProbeMsg {
     Done(usize, Result<MediaInfo, String>),
     ExtraPick(Result<MediaInfo, String>),
+    SyncDone {
+        source: usize,
+        uid: usize,
+        result: Result<OffsetEstimate, String>,
+    },
 }
 
 enum JobMsg {
@@ -394,6 +403,14 @@ impl App {
                             }
                         }
                     }
+                    continue;
+                }
+                ProbeMsg::SyncDone {
+                    source,
+                    uid,
+                    result,
+                } => {
+                    self.apply_sync_result(source, uid, result);
                     continue;
                 }
             };
@@ -777,6 +794,100 @@ impl App {
         };
         let info = extra.info.clone();
         self.play_preview(info, uid, token);
+    }
+
+    /// Подбирает сдвиг внешней дорожки по звуку: сравнивает огибающие громкости
+    /// с аудиодорожкой основного файла.
+    fn estimate_extra_delay(&mut self, source: usize, uid: usize) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(entry) = self.files.get(self.selected) else {
+            return;
+        };
+        let Some(info) = entry.info.clone() else {
+            return;
+        };
+        let Some(extra) = entry.extras.get(source) else {
+            return;
+        };
+        let extra_info = extra.info.clone();
+
+        let Some(main_uid) = main_audio_uid(&info, &entry.keep) else {
+            self.status = "В основном файле нет аудиодорожки — не с чем сравнивать".to_string();
+            return;
+        };
+        if extra_info.streams.get(uid).map(|stream| stream.kind) != Some(StreamKind::Audio) {
+            self.status = "Сдвиг подбирается только для аудио".to_string();
+            return;
+        }
+        if self.tools.ffmpeg.is_none() {
+            self.status = "Для подбора сдвига нужен ffmpeg".to_string();
+            return;
+        }
+
+        if let Some(extra) = self.files[self.selected].extras.get_mut(source) {
+            if let Some(track) = extra.tracks.iter_mut().find(|track| track.uid == uid) {
+                track.syncing = true;
+                track.sync_note = None;
+            }
+        }
+
+        let tools = self.tools.clone();
+        let tx = self.probe_tx.clone();
+        self.status = "Сравниваю звук дорожек…".to_string();
+        std::thread::spawn(move || {
+            let result = estimate_delay(&tools, &info, main_uid, &extra_info, uid)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(ProbeMsg::SyncDone {
+                source,
+                uid,
+                result,
+            });
+        });
+    }
+
+    fn apply_sync_result(
+        &mut self,
+        source: usize,
+        uid: usize,
+        result: Result<OffsetEstimate, String>,
+    ) {
+        let selected = self.selected;
+        let Some(entry) = self.files.get_mut(selected) else {
+            return;
+        };
+        let Some(extra) = entry.extras.get_mut(source) else {
+            return;
+        };
+        let Some(track) = extra.tracks.iter_mut().find(|track| track.uid == uid) else {
+            return;
+        };
+        track.syncing = false;
+        match result {
+            Ok(estimate) => {
+                track.delay_ms = estimate.delay_ms;
+                let sign = if estimate.delay_ms > 0 { "+" } else { "" };
+                track.sync_note = Some(format!(
+                    "{sign}{} мс · окна {}/{} · совпадение {:.0}%",
+                    estimate.delay_ms,
+                    estimate.windows_agree,
+                    estimate.windows_total,
+                    estimate.score.max(0.0) * 100.0
+                ));
+                self.status = match estimate.warnings.first() {
+                    Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
+                    None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
+                };
+                for warning in &estimate.warnings {
+                    self.log.push(format!("Сдвиг: {warning}"));
+                }
+            }
+            Err(err) => {
+                track.sync_note = Some(format!("не удалось: {err}"));
+                self.status = "Не удалось подобрать сдвиг".to_string();
+            }
+        }
     }
 
     fn play_preview(&mut self, info: MediaInfo, uid: usize, token: u64) {
@@ -1364,6 +1475,7 @@ impl App {
             let mut tags_request: Option<usize> = None;
             let mut extract_request: Option<usize> = None;
             let mut extra_preview: Option<(usize, usize)> = None;
+            let mut extra_sync: Option<(usize, usize)> = None;
             let mut extra_remove: Option<(usize, usize)> = None;
             let mut extra_pick = false;
             let mut apply_all = false;
@@ -1748,6 +1860,21 @@ impl App {
                                     "Пометить дорожку как выбранную по умолчанию",
                                 );
                                 if stream.kind == StreamKind::Audio && stream.ff_index.is_some() {
+                                    if track.syncing {
+                                        ui.add(egui::Spinner::new().size(12.0));
+                                        ui.label(
+                                            RichText::new("сравниваю…").small().color(MUTED),
+                                        );
+                                    } else if ui
+                                        .add_enabled(!busy, egui::Button::new("⏱").small())
+                                        .on_hover_text(
+                                            "Подобрать сдвиг по звуку: сравнить с аудиодорожкой \
+                                             основного файла",
+                                        )
+                                        .clicked()
+                                    {
+                                        extra_sync = Some((source_index, track.uid));
+                                    }
                                     let playing = preview_token
                                         == Some(extra_token(source_index, track.uid));
                                     let label = if playing { "■" } else { "▶" };
@@ -1767,6 +1894,13 @@ impl App {
                                     extra_remove = Some((source_index, track_index));
                                 }
                             });
+                            if let Some(note) = &track.sync_note {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    let color = if note.starts_with("не удалось") { RED } else { MUTED };
+                                    ui.label(RichText::new(note).small().color(color));
+                                });
+                            }
                         }
                     }
                         });
@@ -1804,6 +1938,9 @@ impl App {
             }
             if let Some((source, uid)) = extra_preview {
                 self.preview_extra(source, uid);
+            }
+            if let Some((source, uid)) = extra_sync {
+                self.estimate_extra_delay(source, uid);
             }
         });
     }
@@ -2142,6 +2279,8 @@ impl App {
                     uid,
                     delay_ms: 0,
                     default: false,
+                    syncing: false,
+                    sync_note: None,
                 })
                 .collect();
 
@@ -2225,6 +2364,27 @@ fn default_extra_selection(info: &MediaInfo) -> Vec<bool> {
             _ => false,
         })
         .collect()
+}
+
+/// Лучшая дорожка основного файла, с которой сравнивать внешнюю: сначала та,
+/// что останется в результате, иначе — любая аудио.
+fn main_audio_uid(info: &MediaInfo, keep: &[bool]) -> Option<usize> {
+    let usable = |uid: usize, stream: &&StreamInfo| {
+        stream.kind == StreamKind::Audio
+            && stream.ff_index.is_some()
+            && keep.get(uid).copied().unwrap_or(false)
+    };
+    info.streams
+        .iter()
+        .enumerate()
+        .find(|(uid, stream)| usable(*uid, stream))
+        .or_else(|| {
+            info.streams
+                .iter()
+                .enumerate()
+                .find(|(_, stream)| stream.kind == StreamKind::Audio && stream.ff_index.is_some())
+        })
+        .map(|(uid, _)| uid)
 }
 
 fn params_for(stream: &StreamInfo) -> String {
