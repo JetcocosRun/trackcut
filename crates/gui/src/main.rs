@@ -14,10 +14,17 @@ fn main() -> eframe::Result<()> {
         .with_target(false)
         .init();
 
+    let icon = eframe::egui::IconData {
+        rgba: include_bytes!("../assets/icon_128.rgba").to_vec(),
+        width: 128,
+        height: 128,
+    };
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1320.0, 860.0])
             .with_min_inner_size([1040.0, 640.0])
+            .with_icon(icon)
             .with_title("TrackCut"),
         ..Default::default()
     };
