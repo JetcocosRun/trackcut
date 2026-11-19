@@ -8,7 +8,7 @@ use std::time::Duration;
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 use trackcut_core::extract::{default_track_path, ExtractContainer, ExtractPlan};
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamInfo, StreamKind};
-use trackcut_core::plan::{paths_equal, validate};
+use trackcut_core::plan::{parse_ranges, paths_equal, validate, SplitSpec};
 use trackcut_core::{
     estimate_delay, probe, run_extract, run_mux, Error, ExecEvent, ExtraInput, ExtraTrack,
     KeepTrack, MediaInfo, MuxPlan, OffsetEstimate, ToolPaths,
@@ -55,6 +55,27 @@ enum Preset {
     Nothing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SplitChoice {
+    /// Не резать.
+    #[default]
+    None,
+    /// Каждые N минут.
+    Every,
+    /// Диапазоны вида «00:10:00-00:20:00, 00:30:00-».
+    Ranges,
+}
+
+impl SplitChoice {
+    fn label(self) -> &'static str {
+        match self {
+            SplitChoice::None => "Не резать",
+            SplitChoice::Every => "Каждые N минут",
+            SplitChoice::Ranges => "Диапазоны",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ExtraTrackUi {
     uid: usize,
@@ -99,6 +120,9 @@ struct FileEntry {
     default_flag: Vec<bool>,
     forced_flag: Vec<bool>,
     extras: Vec<ExtraSource>,
+    chapters_file: Option<PathBuf>,
+    chapters_label: Option<String>,
+    append: Vec<PathBuf>,
     file_size: u64,
     result: Option<String>,
 }
@@ -116,6 +140,9 @@ impl FileEntry {
             default_flag: Vec::new(),
             forced_flag: Vec::new(),
             extras: Vec::new(),
+            chapters_file: None,
+            chapters_label: None,
+            append: Vec::new(),
             file_size,
             result: None,
         }
@@ -242,6 +269,9 @@ pub struct App {
     keep_attachments: bool,
     mov_text: bool,
     overwrite: bool,
+    split: SplitChoice,
+    split_minutes: f32,
+    split_ranges: String,
 
     filter: String,
     tags_open: Option<usize>,
@@ -263,6 +293,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
+        trackcut_core::chapters::cleanup_temp();
 
         let tools = ToolPaths::detect();
         let tool_versions = tools.versions();
@@ -285,6 +316,9 @@ impl App {
             keep_attachments: true,
             mov_text: false,
             overwrite: false,
+            split: SplitChoice::None,
+            split_minutes: 10.0,
+            split_ranges: String::new(),
             filter: String::new(),
             tags_open: None,
             extra_pick: None,
@@ -561,6 +595,34 @@ impl App {
         candidate
     }
 
+    /// Готовит настройку нарезки из полей панели слева.
+    fn split_spec(&self) -> Result<Option<SplitSpec>, String> {
+        match self.split {
+            SplitChoice::None => Ok(None),
+            SplitChoice::Every => {
+                let minutes = self.split_minutes.max(0.5);
+                Ok(Some(SplitSpec::by_duration(
+                    (minutes * 60_000.0).round() as u64
+                )))
+            }
+            SplitChoice::Ranges => {
+                let text = self.split_ranges.trim();
+                if text.is_empty() {
+                    return Err(
+                        "нарезка по диапазонам: впишите, например, 00:10:00-00:20:00".into(),
+                    );
+                }
+                let ranges = parse_ranges(text).filter(|ranges| !ranges.is_empty()).ok_or_else(
+                    || {
+                        "нарезка по диапазонам: не понял формат. Пример: 00:10:00-00:20:00, 00:30:00-"
+                            .to_string()
+                    },
+                )?;
+                Ok(Some(SplitSpec::by_ranges(ranges)))
+            }
+        }
+    }
+
     fn build_jobs(&self) -> Result<Vec<Job>, String> {
         let mut jobs = Vec::new();
         for (file_index, entry) in self.files.iter().enumerate() {
@@ -611,6 +673,8 @@ impl App {
                 .filter(|extra| !extra.tracks.is_empty())
                 .collect();
 
+            let split = self.split_spec()?;
+
             let plan = MuxPlan {
                 input: entry.path.clone(),
                 output,
@@ -623,6 +687,9 @@ impl App {
                 overwrite: self.overwrite,
                 backend: None,
                 extras,
+                chapters_file: entry.chapters_file.clone(),
+                split,
+                append: entry.append.clone(),
             };
 
             validate(&info, &plan).map_err(|err| format!("{}: {err}", entry.name()))?;
@@ -1003,6 +1070,68 @@ impl App {
             let result = probe::probe(&path, &tools).map_err(|err| err.to_string());
             let _ = tx.send(ProbeMsg::ExtraPick(result));
         });
+    }
+
+    /// Выбирает файл-источник глав: MKV или файл глав (XML/OGM/Simple).
+    fn pick_chapters_file(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Главы или MKV", &["mkv", "xml", "txt", "ogm", "cue"])
+            .pick_file()
+        else {
+            return;
+        };
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let xml = match trackcut_core::resolve_chapters(&path, &self.tools) {
+            Ok(xml) => xml,
+            Err(err) => {
+                self.status = format!("Главы: {err}");
+                return;
+            }
+        };
+        if let Some(entry) = self.files.get_mut(self.selected) {
+            entry.chapters_file = Some(xml);
+            entry.chapters_label = Some(label);
+        }
+        self.status = format!("Главы из: {}", path.display());
+    }
+
+    /// Добавляет файлы в склейку (append) текущего файла.
+    fn pick_append_files(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Видео", &["mkv", "webm", "mp4", "mov", "m4v"])
+            .pick_files()
+        else {
+            return;
+        };
+        let added = {
+            let Some(entry) = self.files.get_mut(self.selected) else {
+                return;
+            };
+            let mut added = 0;
+            for path in paths {
+                if paths_equal(&path, &entry.path)
+                    || entry
+                        .append
+                        .iter()
+                        .any(|existing| paths_equal(existing, &path))
+                {
+                    continue;
+                }
+                entry.append.push(path);
+                added += 1;
+            }
+            added
+        };
+        self.status = format!("В склейку добавлено файлов: {added}");
     }
 
     fn apply_preset(&mut self, preset: Preset) {
@@ -1422,6 +1551,52 @@ impl App {
                 ui.checkbox(&mut self.overwrite, "Перезаписывать существующие файлы");
 
                 ui.add_space(6.0);
+                ui.label(RichText::new("Нарезка").strong().small());
+                egui::ComboBox::from_id_salt("split_kind")
+                    .selected_text(self.split.label())
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for choice in [SplitChoice::None, SplitChoice::Every, SplitChoice::Ranges] {
+                            ui.selectable_value(&mut self.split, choice, choice.label());
+                        }
+                    });
+                match self.split {
+                    SplitChoice::None => {}
+                    SplitChoice::Every => {
+                        ui.horizontal(|ui| {
+                            ui.label("Каждые");
+                            ui.add(
+                                egui::DragValue::new(&mut self.split_minutes)
+                                    .range(1.0..=240.0)
+                                    .speed(1.0)
+                                    .suffix(" мин"),
+                            );
+                        });
+                    }
+                    SplitChoice::Ranges => {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.split_ranges)
+                                .hint_text("00:10:00-00:20:00, 00:30:00-")
+                                .desired_width(190.0),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Начало-конец через запятую; пустой конец — до конца файла",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    }
+                }
+                if self.split != SplitChoice::None {
+                    ui.label(
+                        RichText::new("Только MKV/WebM · резка по ключевым кадрам")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+
+                ui.add_space(6.0);
                 if ui
                     .add_enabled(
                         self.files
@@ -1479,6 +1654,10 @@ impl App {
             let mut extra_remove: Option<(usize, usize)> = None;
             let mut extra_pick = false;
             let mut apply_all = false;
+            let mut chapters_pick = false;
+            let mut chapters_clear = false;
+            let mut append_pick = false;
+            let mut append_remove: Option<usize> = None;
 
             let file_size;
             {
@@ -1766,6 +1945,78 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
+                    ui.label(RichText::new("Главы").strong());
+                    if info.chapters_count > 0 {
+                        ui.label(
+                            RichText::new(format!("{}", info.chapters_count))
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(file) = &entry.chapters_file {
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Не импортировать главы")
+                                .clicked()
+                            {
+                                chapters_clear = true;
+                            }
+                            let name = entry
+                                .chapters_label
+                                .clone()
+                                .unwrap_or_else(|| file.display().to_string());
+                            ui.label(
+                                RichText::new(truncate_chars(&name, 28))
+                                    .color(ACCENT)
+                                    .small(),
+                            )
+                            .on_hover_text(file.display().to_string());
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Импорт глав…"))
+                            .on_hover_text("Взять главы из другого MKV или из файла глав (XML/OGM)")
+                            .clicked()
+                        {
+                            chapters_pick = true;
+                        }
+                    });
+                });
+                if info.chapters.is_empty() {
+                    ui.label(
+                        RichText::new(if info.chapters_count > 0 {
+                            "Список глав не прочитан — mkvmerge скопирует их как есть."
+                        } else {
+                            "Глав нет. Можно импортировать из другого файла."
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                } else {
+                    egui::CollapsingHeader::new(format!("Список глав ({})", info.chapters.len()))
+                        .id_salt("chapters")
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("chapters_scroll")
+                                .max_height(110.0)
+                                .show(ui, |ui| {
+                                    for (index, chapter) in info.chapters.iter().enumerate() {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{:>2}. {}",
+                                                index + 1,
+                                                chapter.label()
+                                            ))
+                                            .small(),
+                                        );
+                                    }
+                                });
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
                     ui.label(RichText::new("Дорожки из других файлов").strong());
                     let extra_count: usize =
                         entry.extras.iter().map(|extra| extra.tracks.len()).sum();
@@ -1905,6 +2156,62 @@ impl App {
                     }
                         });
                 }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Склейка (append)").strong());
+                    if !entry.append.is_empty() {
+                        ui.label(
+                            RichText::new(format!("+{}", entry.append.len()))
+                                .color(GREEN)
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("＋ Приклеить файл…"))
+                            .on_hover_text(
+                                "Дописать другой файл в конец результата. Кодеки и параметры \
+                                 дорожек должны совпадать",
+                            )
+                            .clicked()
+                        {
+                            append_pick = true;
+                        }
+                    });
+                });
+                if entry.append.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Например, вторая часть фильма или продолжение серии — склеится \
+                             в один файл без перекодирования.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                } else {
+                    for (index, path) in entry.append.iter().enumerate() {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}. {}",
+                                    index + 1,
+                                    truncate_chars(&name, 44)
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(path.display().to_string());
+                            if ui.small_button("✕").clicked() {
+                                append_remove = Some(index);
+                            }
+                        });
+                    }
+                }
             }
 
             if let Some(preset) = preset_action {
@@ -1941,6 +2248,27 @@ impl App {
             }
             if let Some((source, uid)) = extra_sync {
                 self.estimate_extra_delay(source, uid);
+            }
+            if chapters_clear {
+                if let Some(entry) = self.files.get_mut(self.selected) {
+                    entry.chapters_file = None;
+                    entry.chapters_label = None;
+                }
+                self.status = "Импорт глав отменён".into();
+            }
+            if chapters_pick {
+                self.pick_chapters_file();
+            }
+            if append_pick {
+                self.pick_append_files();
+            }
+            if let Some(index) = append_remove {
+                if let Some(entry) = self.files.get_mut(self.selected) {
+                    if index < entry.append.len() {
+                        entry.append.remove(index);
+                    }
+                }
+                self.status = "Файл убран из склейки".into();
             }
         });
     }

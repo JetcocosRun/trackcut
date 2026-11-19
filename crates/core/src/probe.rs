@@ -3,7 +3,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::model::{AttachmentInfo, MediaInfo, StreamInfo, StreamKind};
+use crate::model::{AttachmentInfo, Chapter, MediaInfo, StreamInfo, StreamKind};
 use crate::sys::hidden_command;
 use crate::tools::ToolPaths;
 
@@ -319,9 +319,10 @@ fn apply_mkvmerge(info: &mut MediaInfo, json: &Value) {
         }
     }
 
-    info.chapters = chapter_count(json)
+    info.chapters_count = chapter_count(json)
         .or_else(|| file.and_then(chapter_count))
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(info.chapters.len());
 
     if let Some(attachments) = json
         .get("attachments")
@@ -359,6 +360,28 @@ fn chapter_count(value: &Value) -> Option<usize> {
     }
 }
 
+/// Одна глава из `ffprobe -show_chapters`.
+fn parse_chapter(value: &Value) -> Chapter {
+    let start_ms = value
+        .get("start_time")
+        .and_then(value_as_f64)
+        .map(|secs| (secs.max(0.0) * 1000.0).round() as u64)
+        .unwrap_or(0);
+    let end_ms = value
+        .get("end_time")
+        .and_then(value_as_f64)
+        .filter(|secs| *secs > 0.0)
+        .map(|secs| (secs * 1000.0).round() as u64);
+    let title = value
+        .get("tags")
+        .and_then(|tags| tags.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+    Chapter::new(start_ms, end_ms, title)
+}
+
 fn apply_ffprobe(info: &mut MediaInfo, json: &Value) {
     let duration_ms = json
         .get("format")
@@ -393,7 +416,8 @@ fn apply_ffprobe(info: &mut MediaInfo, json: &Value) {
 
     if let Some(chapters) = json.get("chapters").and_then(Value::as_array) {
         if !chapters.is_empty() {
-            info.chapters = chapters.len();
+            info.chapters = chapters.iter().map(parse_chapter).collect();
+            info.chapters_count = info.chapters_count.max(info.chapters.len());
         }
     }
 
@@ -706,6 +730,6 @@ mod tests {
 
         assert_eq!(info.streams.len(), 1);
         assert_eq!(info.streams[0].mkv_id, Some(1));
-        assert_eq!(info.chapters, 4);
+        assert_eq!(info.chapters_count, 4);
     }
 }

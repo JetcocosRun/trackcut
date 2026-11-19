@@ -117,6 +117,7 @@ pub fn prepare_extract(
             args,
             output_part,
             output_final,
+            split: None,
         },
         warnings,
     })

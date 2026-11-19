@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::model::{Backend, MediaInfo};
-use crate::plan::{prepare, MuxPlan, PreparedCommand};
+use crate::plan::{prepare, CommandSpec, MuxPlan, PreparedCommand};
 use crate::sys::hidden_command;
 use crate::tools::ToolPaths;
 
@@ -111,7 +111,7 @@ fn run_prepared(
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&spec.output_part);
+            cleanup_outputs(&spec);
             return Err(Error::Cancelled);
         }
 
@@ -169,6 +169,7 @@ fn run_prepared(
             .collect::<Vec<_>>()
             .join("\n");
         let _ = std::fs::remove_file(&spec.output_part);
+        cleanup_outputs(&spec);
         return Err(Error::CommandFailed {
             program: spec.program.display().to_string(),
             code,
@@ -181,6 +182,10 @@ fn run_prepared(
             "mkvmerge завершился с предупреждениями — проверьте лог (результат обычно корректен)"
                 .to_string(),
         );
+    }
+
+    if spec.split.is_some() {
+        return finish_split(spec, warnings, log, verify, on_event);
     }
 
     let metadata = std::fs::metadata(&spec.output_part).map_err(|err| {
@@ -213,6 +218,124 @@ fn run_prepared(
     on_event(ExecEvent::Progress(1.0));
     Ok(MuxOutcome {
         output: spec.output_final,
+        backend: spec.backend,
+        warnings,
+        log,
+    })
+}
+
+/// Убирает временные файлы, включая части нарезки `<part>-NNN`.
+fn cleanup_outputs(spec: &CommandSpec) {
+    let _ = std::fs::remove_file(&spec.output_part);
+    for part in split_parts(spec) {
+        let _ = std::fs::remove_file(part);
+    }
+}
+
+/// Файлы, которые mkvmerge создал в режиме `--split`.
+fn split_parts(spec: &CommandSpec) -> Vec<PathBuf> {
+    let (Some(parent), Some(stem)) = (
+        spec.output_part.parent(),
+        spec.output_part
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string()),
+    ) else {
+        return Vec::new();
+    };
+    let extension = spec
+        .output_part
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let prefix = format!("{stem}-");
+    let mut parts: Vec<PathBuf> = std::fs::read_dir(parent)
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+                    name.is_some_and(|name| name.starts_with(&prefix))
+                        && ext.as_deref() == Some(extension.as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.sort();
+    parts
+}
+
+/// Нарезка: mkvmerge пишет `<stem>.part-001.mkv`, отдаём пользователю `<stem>-001.mkv`.
+fn finish_split(
+    spec: CommandSpec,
+    mut warnings: Vec<String>,
+    log: Vec<String>,
+    verify: impl FnOnce(&Path) -> Result<Vec<String>>,
+    mut on_event: impl FnMut(ExecEvent),
+) -> Result<MuxOutcome> {
+    let mut parts = split_parts(&spec);
+    let single = parts.is_empty() && spec.output_part.is_file();
+    if single {
+        // Если часть одна, mkvmerge пишет её без числового суффикса.
+        parts.push(spec.output_part.clone());
+    }
+    if parts.is_empty() {
+        return Err(Error::Other(
+            "нарезка не создала ни одного файла — проверьте диапазон и лог mkvmerge".to_string(),
+        ));
+    }
+
+    match verify(&parts[0]) {
+        Ok(extra) => warnings.extend(extra),
+        Err(err) => {
+            cleanup_outputs(&spec);
+            return Err(err);
+        }
+    }
+
+    let (Some(parent), Some(stem)) = (
+        spec.output_final.parent(),
+        spec.output_final
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string()),
+    ) else {
+        cleanup_outputs(&spec);
+        return Err(Error::Other(
+            "не удалось определить папку для частей нарезки".to_string(),
+        ));
+    };
+
+    let mut finals = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let target = if single {
+            spec.output_final.clone()
+        } else {
+            let name = part
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let suffix = name
+                .rsplit_once('-')
+                .map(|(_, suffix)| suffix.to_string())
+                .unwrap_or_else(|| name.clone());
+            parent.join(format!("{stem}-{suffix}"))
+        };
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        std::fs::rename(part, &target)?;
+        finals.push(target);
+    }
+
+    on_event(ExecEvent::Message(format!(
+        "нарезка: {} файл(ов) — {}",
+        finals.len(),
+        parent.display()
+    )));
+    on_event(ExecEvent::Progress(1.0));
+
+    Ok(MuxOutcome {
+        output: finals[0].clone(),
         backend: spec.backend,
         warnings,
         log,

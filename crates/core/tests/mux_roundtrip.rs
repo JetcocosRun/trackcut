@@ -185,6 +185,9 @@ fn removes_unwanted_audio_and_subtitles_without_reencoding() {
         overwrite: true,
         backend: None,
         extras: Vec::new(),
+        chapters_file: None,
+        split: None,
+        append: Vec::new(),
     };
 
     let outcome = run_mux(
@@ -247,6 +250,9 @@ fn remuxes_to_mp4_with_ffmpeg() {
         overwrite: true,
         backend: None,
         extras: Vec::new(),
+        chapters_file: None,
+        split: None,
+        append: Vec::new(),
     };
 
     let outcome = run_mux(
@@ -363,6 +369,9 @@ fn extracts_audio_then_attaches_it_to_another_file() {
                 forced: None,
             }],
         }],
+        chapters_file: None,
+        split: None,
+        append: Vec::new(),
     };
 
     let outcome = run_mux(

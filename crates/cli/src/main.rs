@@ -6,10 +6,10 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use trackcut_core::extract::{default_track_path, prepare_extract, ExtractContainer, ExtractPlan};
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamKind};
-use trackcut_core::plan::{default_output_path, paths_equal, prepare};
+use trackcut_core::plan::{default_output_path, parse_ranges, parse_time_ms, paths_equal, prepare};
 use trackcut_core::{
     estimate_delay, probe, run_extract, run_mux, ExecEvent, ExtraInput, ExtraTrack, MediaInfo,
-    MuxPlan, ToolPaths,
+    MuxPlan, SplitSpec, ToolPaths,
 };
 
 #[derive(Parser)]
@@ -68,6 +68,21 @@ enum Command {
         /// Сдвиг добавленных дорожек, мс (положительный — позже).
         #[arg(long = "add-delay", default_value_t = 0)]
         add_delay: i64,
+        /// Импортировать главы из файла (XML, OGM или Matroska).
+        #[arg(long, value_name = "FILE")]
+        chapters: Option<PathBuf>,
+        /// Нарезать результат по размеру части (например, 1000M или 700M).
+        #[arg(long, value_name = "SIZE")]
+        split_size: Option<String>,
+        /// Нарезать по длительности каждой части (00:10:00 или 600).
+        #[arg(long, value_name = "TIME")]
+        split_duration: Option<String>,
+        /// Вырезать диапазоны: 00:01:00-00:05:00,00:10:00- (конец — до конца файла).
+        #[arg(long, value_name = "RANGES")]
+        split_parts: Option<String>,
+        /// Приклеить файл к исходному (тот же набор дорожек, MKV/WebM).
+        #[arg(long = "append", value_name = "FILE")]
+        append: Vec<PathBuf>,
         /// Перезаписать существующий выходной файл.
         #[arg(long, short = 'y')]
         overwrite: bool,
@@ -115,6 +130,7 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let tools = ToolPaths::detect();
+    trackcut_core::chapters::cleanup_temp();
 
     let result = match cli.command {
         Command::Probe {
@@ -146,6 +162,11 @@ fn main() {
             mov_text,
             add,
             add_delay,
+            chapters,
+            split_size,
+            split_duration,
+            split_parts,
+            append,
             overwrite,
             dry_run,
         } => cmd_mux(
@@ -162,6 +183,11 @@ fn main() {
             mov_text,
             &add,
             add_delay,
+            chapters,
+            split_size,
+            split_duration,
+            split_parts,
+            &append,
             overwrite,
             dry_run,
         ),
@@ -273,7 +299,7 @@ fn print_info(info: &MediaInfo, verbose: bool) {
     );
     println!(
         "Главы:     {} · Вложения: {}",
-        info.chapters,
+        info.chapters_count,
         info.attachments.len()
     );
     println!();
@@ -334,6 +360,20 @@ fn print_info(info: &MediaInfo, verbose: bool) {
         }
     }
 
+    if !info.chapters.is_empty() {
+        println!();
+        println!("Главы:");
+        for (index, chapter) in info.chapters.iter().enumerate() {
+            println!("  {:>2}. {}", index + 1, chapter.label());
+        }
+    } else if info.chapters_count > 0 {
+        println!();
+        println!(
+            "Главы: {} (содержимое прочитать не удалось)",
+            info.chapters_count
+        );
+    }
+
     if !info.attachments.is_empty() {
         println!();
         println!("Вложения:");
@@ -372,6 +412,11 @@ fn cmd_mux(
     mov_text: bool,
     add: &[PathBuf],
     add_delay: i64,
+    chapters: Option<PathBuf>,
+    split_size: Option<String>,
+    split_duration: Option<String>,
+    split_parts: Option<String>,
+    append: &[PathBuf],
     overwrite: bool,
     dry_run: bool,
 ) -> Result<(), String> {
@@ -419,6 +464,17 @@ fn cmd_mux(
 
     let selected = select_streams(&info, &keep, &drop)?;
     let extras = build_extras(tools, add, add_delay)?;
+    let chapters = match chapters {
+        Some(path) => {
+            Some(trackcut_core::resolve_chapters(&path, tools).map_err(|err| err.to_string())?)
+        }
+        None => None,
+    };
+    let split = build_split(
+        split_size.as_deref(),
+        split_duration.as_deref(),
+        split_parts.as_deref(),
+    )?;
     let plan = MuxPlan {
         input: input.clone(),
         output: output.clone(),
@@ -431,7 +487,20 @@ fn cmd_mux(
         overwrite,
         backend: None,
         extras,
+        chapters_file: chapters,
+        split,
+        append: append.to_vec(),
     };
+
+    if let Some(split) = &plan.split {
+        eprintln!("Нарезка: {}", split.label());
+    }
+    if let Some(chapters) = &plan.chapters_file {
+        eprintln!("Главы из: {}", chapters.display());
+    }
+    if !plan.append.is_empty() {
+        eprintln!("Склейка: {} файл(ов)", plan.append.len());
+    }
 
     let prepared = prepare(&info, &plan, tools).map_err(|err| err.to_string())?;
     for warning in &prepared.warnings {
@@ -481,6 +550,40 @@ fn cmd_mux(
         println!("  последняя строка лога: {line}");
     }
     Ok(())
+}
+
+fn build_split(
+    size: Option<&str>,
+    duration: Option<&str>,
+    parts: Option<&str>,
+) -> Result<Option<SplitSpec>, String> {
+    let modes = [size.is_some(), duration.is_some(), parts.is_some()]
+        .iter()
+        .filter(|set| **set)
+        .count();
+    if modes > 1 {
+        return Err(
+            "выберите один способ нарезки: --split-size, --split-duration или --split-parts"
+                .to_string(),
+        );
+    }
+    if let Some(size) = size {
+        return Ok(Some(SplitSpec::by_size(size.trim())));
+    }
+    if let Some(duration) = duration {
+        let ms = parse_time_ms(duration)
+            .ok_or_else(|| format!("не понимаю длительность части: {duration}"))?;
+        if ms == 0 {
+            return Err("длительность части должна быть больше нуля".to_string());
+        }
+        return Ok(Some(SplitSpec::by_duration(ms)));
+    }
+    if let Some(parts) = parts {
+        let ranges = parse_ranges(parts)
+            .ok_or_else(|| format!("не понимаю диапазоны: {parts} (нужно 00:01:00-00:05:00)"))?;
+        return Ok(Some(SplitSpec::by_ranges(ranges)));
+    }
+    Ok(None)
 }
 
 fn parse_container(value: &str) -> Result<OutputContainer, String> {

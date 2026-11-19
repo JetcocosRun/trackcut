@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::model::{Backend, MediaInfo, OutputContainer, StreamInfo, StreamKind};
+use crate::model::{format_duration, Backend, MediaInfo, OutputContainer, StreamInfo, StreamKind};
 use crate::tools::ToolPaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +58,159 @@ impl ExtraInput {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitSpec {
+    /// Максимальный размер каждой части, например `1000M`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Длительность каждой части в миллисекундах.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Диапазоны (начало, конец) в миллисекундах; `None` — до конца файла.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<(u64, Option<u64>)>,
+}
+
+impl SplitSpec {
+    pub fn by_size(size: impl Into<String>) -> Self {
+        Self {
+            size: Some(size.into()),
+            duration_ms: None,
+            ranges: Vec::new(),
+        }
+    }
+
+    pub fn by_duration(ms: u64) -> Self {
+        Self {
+            size: None,
+            duration_ms: Some(ms),
+            ranges: Vec::new(),
+        }
+    }
+
+    pub fn by_ranges(ranges: Vec<(u64, Option<u64>)>) -> Self {
+        Self {
+            size: None,
+            duration_ms: None,
+            ranges,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size.is_none() && self.duration_ms.is_none() && self.ranges.is_empty()
+    }
+
+    /// Значение для `mkvmerge --split`.
+    pub fn mkvmerge_value(&self, duration_ms: Option<u64>) -> Option<String> {
+        if let Some(size) = self.size.as_deref() {
+            return Some(format!("size:{size}"));
+        }
+        if let Some(ms) = self.duration_ms {
+            return Some(format!("duration:{}", format_timestamp(ms)));
+        }
+        if !self.ranges.is_empty() {
+            let end = duration_ms.unwrap_or(0);
+            let parts: Vec<String> = self
+                .ranges
+                .iter()
+                .map(|(start, finish)| {
+                    format!(
+                        "{}-{}",
+                        format_timestamp(*start),
+                        format_timestamp(finish.unwrap_or(end))
+                    )
+                })
+                .collect();
+            return Some(format!("parts:{}", parts.join(",")));
+        }
+        None
+    }
+
+    /// Человеческая подпись для логов и GUI.
+    pub fn label(&self) -> String {
+        if let Some(size) = self.size.as_deref() {
+            return format!("по {size}");
+        }
+        if let Some(ms) = self.duration_ms {
+            return format!("по {}", format_duration(ms));
+        }
+        self.ranges
+            .iter()
+            .map(|(start, end)| match end {
+                Some(end) => format!("{}–{}", format_duration(*start), format_duration(*end)),
+                None => format!("с {}", format_duration(*start)),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// `HH:MM:SS.mmm` — формат времени mkvmerge.
+pub fn format_timestamp(ms: u64) -> String {
+    let hours = ms / 3_600_000;
+    let minutes = (ms % 3_600_000) / 60_000;
+    let seconds = (ms % 60_000) / 1000;
+    let millis = ms % 1000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+/// Разбирает время из `90`, `90s`, `01:30`, `00:01:30.500`.
+pub fn parse_time_ms(text: &str) -> Option<u64> {
+    let text = text.trim().trim_end_matches(['s', 'с', 'S', 'С']);
+    if text.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = text.split(':').collect();
+    let to_ms = |value: &str| -> Option<f64> {
+        let value = value.trim().replace(',', ".");
+        if value.is_empty() {
+            return None;
+        }
+        value.parse::<f64>().ok().filter(|v| *v >= 0.0)
+    };
+    let seconds = match parts.as_slice() {
+        [seconds] => to_ms(seconds)?,
+        [minutes, seconds] => to_ms(minutes)? * 60.0 + to_ms(seconds)?,
+        [hours, minutes, seconds] => {
+            to_ms(hours)? * 3600.0 + to_ms(minutes)? * 60.0 + to_ms(seconds)?
+        }
+        _ => return None,
+    };
+    Some((seconds * 1000.0).round() as u64)
+}
+
+/// Разбирает диапазоны вида `00:01:00-00:05:00, 00:10:00-`.
+pub fn parse_ranges(text: &str) -> Option<Vec<(u64, Option<u64>)>> {
+    let mut ranges = Vec::new();
+    for item in text.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (start, end) = match item.split_once('-') {
+            Some((start, end)) => (start.trim(), Some(end.trim())),
+            None => (item, None),
+        };
+        let start = parse_time_ms(start)?;
+        let end = match end {
+            Some("") => None,
+            Some(end) => Some(parse_time_ms(end)?),
+            None => None,
+        };
+        if let Some(end) = end {
+            if end <= start {
+                return None;
+            }
+        }
+        ranges.push((start, end));
+    }
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxPlan {
     pub input: PathBuf,
@@ -76,6 +229,15 @@ pub struct MuxPlan {
     /// Файлы-источники дополнительных дорожек.
     #[serde(default)]
     pub extras: Vec<ExtraInput>,
+    /// Импорт глав из внешнего файла вместо глав источника.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapters_file: Option<PathBuf>,
+    /// Нарезка результата на части.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitSpec>,
+    /// Файлы, которые приклеиваются к основному (mkvmerge `+файл`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append: Vec<PathBuf>,
 }
 
 impl MuxPlan {
@@ -98,6 +260,9 @@ impl MuxPlan {
             overwrite: false,
             backend: None,
             extras: Vec::new(),
+            chapters_file: None,
+            split: None,
+            append: Vec::new(),
         }
     }
 
@@ -129,6 +294,8 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
     pub output_part: PathBuf,
     pub output_final: PathBuf,
+    /// Если задано — инструмент создаст несколько файлов `<part>-NNN`.
+    pub split: Option<SplitSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +327,7 @@ pub fn prepare(info: &MediaInfo, plan: &MuxPlan, tools: &ToolPaths) -> Result<Pr
                 args,
                 output_part,
                 output_final,
+                split: plan.split.clone(),
             }
         }
         Backend::Ffmpeg => {
@@ -171,6 +339,7 @@ pub fn prepare(info: &MediaInfo, plan: &MuxPlan, tools: &ToolPaths) -> Result<Pr
                 args,
                 output_part,
                 output_final,
+                split: None,
             }
         }
     };
@@ -191,21 +360,27 @@ fn resolve_backend(
         .chain(plan.extra_streams())
         .all(|stream| stream.mkv_id.is_some());
 
-    let requested = plan.backend.unwrap_or_else(|| {
-        if plan.container.supports_mkvmerge()
+    let needs_mkvmerge =
+        plan.split.is_some() || !plan.append.is_empty() || plan.chapters_file.is_some();
+
+    let prefer_mkvmerge = needs_mkvmerge
+        || (plan.container.supports_mkvmerge()
             && tools.mkvmerge.is_some()
             && all_have_mkv_ids
-            && !info.has_buttons()
-        {
-            Backend::Mkvmerge
-        } else {
-            Backend::Ffmpeg
-        }
+            && !info.has_buttons());
+
+    let requested = plan.backend.unwrap_or(if prefer_mkvmerge {
+        Backend::Mkvmerge
+    } else {
+        Backend::Ffmpeg
     });
 
     match requested {
         Backend::Mkvmerge => {
             if tools.mkvmerge.is_none() {
+                if needs_mkvmerge {
+                    return Err(Error::ToolMissing("mkvmerge"));
+                }
                 if tools.ffmpeg.is_some() {
                     warnings.push(
                         "mkvmerge не найден — использую ffmpeg (вложения и часть тегов могут не сохраниться)"
@@ -216,6 +391,12 @@ fn resolve_backend(
                 return Err(Error::ToolMissing("mkvmerge"));
             }
             if !all_have_mkv_ids {
+                if needs_mkvmerge {
+                    return Err(Error::InvalidPlan(
+                        "для нарезки, склейки или импорта глав нужны ID дорожек mkvmerge"
+                            .to_string(),
+                    ));
+                }
                 if tools.ffmpeg.is_some() {
                     warnings.push(
                         "для части дорожек нет ID mkvmerge — переключаюсь на ffmpeg".to_string(),
@@ -283,6 +464,60 @@ pub fn validate(info: &MediaInfo, plan: &MuxPlan) -> Result<Vec<String>> {
 
     if plan.output.exists() && !plan.overwrite {
         return Err(Error::OutputExists(plan.output.clone()));
+    }
+
+    if let Some(split) = &plan.split {
+        if split.is_empty() {
+            return Err(Error::InvalidPlan(
+                "нарезка выбрана, но не задан размер или диапазон".to_string(),
+            ));
+        }
+        if !plan.container.supports_mkvmerge() {
+            return Err(Error::InvalidPlan(
+                "нарезка пока поддерживается только для MKV и WebM".to_string(),
+            ));
+        }
+        if let Some(size) = split.size.as_deref() {
+            if size.trim().is_empty() {
+                return Err(Error::InvalidPlan(
+                    "пустой размер части для нарезки".to_string(),
+                ));
+            }
+        }
+    }
+
+    if !plan.append.is_empty() && !plan.container.supports_mkvmerge() {
+        return Err(Error::InvalidPlan(
+            "склейка (append) пока поддерживается только для MKV и WebM".to_string(),
+        ));
+    }
+
+    for path in &plan.append {
+        if !path.is_file() {
+            return Err(Error::InvalidPlan(format!(
+                "файл для склейки не найден: {}",
+                path.display()
+            )));
+        }
+        if paths_equal(path, &plan.output) {
+            return Err(Error::InvalidPlan(
+                "выходной файл совпадает с одним из склеиваемых".to_string(),
+            ));
+        }
+    }
+
+    if let Some(chapters) = &plan.chapters_file {
+        if !chapters.is_file() {
+            return Err(Error::InvalidPlan(format!(
+                "файл глав не найден: {}",
+                chapters.display()
+            )));
+        }
+        if !plan.container.supports_mkvmerge() {
+            return Err(Error::InvalidPlan(
+                "импорт глав поддерживается только для MKV и WebM".to_string(),
+            ));
+        }
     }
 
     let mut warnings = Vec::new();
@@ -492,7 +727,7 @@ fn mkvmerge_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<Os
     }
     args.push("-B".into());
 
-    if !plan.keep_chapters {
+    if !plan.keep_chapters && plan.chapters_file.is_none() {
         args.push("--no-chapters".into());
     }
     if !plan.keep_tags {
@@ -501,6 +736,18 @@ fn mkvmerge_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<Os
     }
     if !plan.keep_attachments {
         args.push("--no-attachments".into());
+    }
+
+    if let Some(chapters) = &plan.chapters_file {
+        args.push("--chapters".into());
+        args.push(chapters.clone().into_os_string());
+    }
+
+    if let Some(split) = &plan.split {
+        if let Some(value) = split.mkvmerge_value(info.duration_ms) {
+            args.push("--split".into());
+            args.push(value.into());
+        }
     }
 
     for entry in &plan.keep {
@@ -521,6 +768,11 @@ fn mkvmerge_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<Os
     }
 
     args.push(info.path.clone().into_os_string());
+
+    for path in &plan.append {
+        args.push("+".into());
+        args.push(path.clone().into_os_string());
+    }
 
     for extra in &plan.extras {
         if extra.tracks.is_empty() {
@@ -669,7 +921,7 @@ fn ffmpeg_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<OsSt
     args.push(if plan.keep_tags { "0" } else { "-1" }.into());
 
     args.push("-map_chapters".into());
-    let copy_chapters = plan.keep_chapters && info.chapters > 0;
+    let copy_chapters = plan.keep_chapters && info.chapters_count > 0;
     args.push(if copy_chapters { "0" } else { "-1" }.into());
 
     if plan.container.is_mp4_family() {
@@ -807,7 +1059,12 @@ mod tests {
                 stream(StreamKind::Audio, 2, 2, "A_AC3", "eng"),
                 stream(StreamKind::Subtitle, 3, 3, "S_TEXT/UTF8", "rus"),
             ],
-            chapters: 3,
+            chapters: vec![
+                crate::model::Chapter::new(0, Some(60_000), Some("Intro".to_string())),
+                crate::model::Chapter::new(60_000, Some(120_000), None),
+                crate::model::Chapter::new(120_000, None, Some("End".to_string())),
+            ],
+            chapters_count: 3,
             attachments: Vec::new(),
             tags: BTreeMap::new(),
         }
@@ -826,6 +1083,9 @@ mod tests {
             overwrite: true,
             backend: None,
             extras: Vec::new(),
+            chapters_file: None,
+            split: None,
+            append: Vec::new(),
         }
     }
 
@@ -973,6 +1233,84 @@ mod tests {
         let mut plan = plan(OutputContainer::Mkv, vec![0]);
         plan.extras.push(dub_extra(0));
         plan.output = PathBuf::from("dub.mka");
+        let err = prepare(&info, &plan, &tools()).unwrap_err();
+        assert!(matches!(err, Error::InvalidPlan(_)), "{err:?}");
+    }
+
+    #[test]
+    fn parses_times_and_ranges() {
+        assert_eq!(parse_time_ms("90"), Some(90_000));
+        assert_eq!(parse_time_ms("90s"), Some(90_000));
+        assert_eq!(parse_time_ms("01:30"), Some(90_000));
+        assert_eq!(parse_time_ms("00:01:30.5"), Some(90_500));
+        assert_eq!(parse_time_ms("1:02:03"), Some(3_723_000));
+        assert_eq!(parse_time_ms("abc"), None);
+        assert_eq!(parse_time_ms("-5"), None);
+
+        assert_eq!(
+            parse_ranges("00:10:00-00:20:00, 00:30:00-"),
+            Some(vec![(600_000, Some(1_200_000)), (1_800_000, None)])
+        );
+        assert_eq!(parse_ranges("00:20:00-00:10:00"), None);
+        assert_eq!(parse_ranges(""), None);
+    }
+
+    #[test]
+    fn split_becomes_mkvmerge_argument() {
+        let info = sample_info();
+
+        let mut by_duration = plan(OutputContainer::Mkv, vec![0]);
+        by_duration.split = Some(SplitSpec::by_duration(600_000));
+        let line = command_line(&prepare(&info, &by_duration, &tools()).unwrap());
+        assert!(line.contains("--split duration:00:10:00.000"), "{line}");
+
+        let mut by_ranges = plan(OutputContainer::Mkv, vec![0]);
+        by_ranges.split = Some(SplitSpec::by_ranges(vec![(0, Some(20_000))]));
+        let line = command_line(&prepare(&info, &by_ranges, &tools()).unwrap());
+        assert!(
+            line.contains("--split parts:00:00:00.000-00:00:20.000"),
+            "{line}"
+        );
+
+        let mut by_size = plan(OutputContainer::Mkv, vec![0]);
+        by_size.split = Some(SplitSpec::by_size("1000M"));
+        let line = command_line(&prepare(&info, &by_size, &tools()).unwrap());
+        assert!(line.contains("--split size:1000M"), "{line}");
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("trackcut-plan-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    #[test]
+    fn chapters_import_and_append_become_arguments() {
+        let info = sample_info();
+        let chapters = temp_file("chapters.xml");
+        let second = temp_file("second.mkv");
+
+        let mut plan = plan(OutputContainer::Mkv, vec![0]);
+        plan.chapters_file = Some(chapters.clone());
+        plan.append = vec![second.clone()];
+
+        let line = command_line(&prepare(&info, &plan, &tools()).unwrap());
+        assert!(line.contains("--chapters"), "{line}");
+        assert!(line.contains(&chapters.display().to_string()), "{line}");
+        assert!(line.contains(&format!("+ {}", second.display())), "{line}");
+        assert!(!line.contains("--no-chapters"), "{line}");
+
+        let _ = std::fs::remove_file(chapters);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn splitting_requires_mkvmerge_and_mkv_ids() {
+        let mut info = sample_info();
+        info.streams[0].mkv_id = None;
+        let mut plan = plan(OutputContainer::Mkv, vec![0]);
+        plan.split = Some(SplitSpec::by_duration(600_000));
         let err = prepare(&info, &plan, &tools()).unwrap_err();
         assert!(matches!(err, Error::InvalidPlan(_)), "{err:?}");
     }

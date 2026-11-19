@@ -118,13 +118,43 @@ pub struct AttachmentInfo {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Chapter {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub title: Option<String>,
+}
+
+impl Chapter {
+    pub fn new(start_ms: u64, end_ms: Option<u64>, title: Option<String>) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            title,
+        }
+    }
+
+    /// Подпись вида `00:01:23 — Название` для списков в GUI и CLI.
+    pub fn label(&self) -> String {
+        let time = format_duration(self.start_ms);
+        match self.title.as_deref().map(str::trim) {
+            Some(title) if !title.is_empty() => format!("{time} — {title}"),
+            _ => time,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub path: PathBuf,
     pub container: String,
     pub duration_ms: Option<u64>,
     pub streams: Vec<StreamInfo>,
-    pub chapters: usize,
+    /// Полный список глав (если контейнер отдаёт их ffprobe/mkvmerge).
+    pub chapters: Vec<Chapter>,
+    /// Число глав по данным контейнера. Может быть больше `chapters.len()`,
+    /// если главы есть, но их содержимое прочитать не удалось.
+    pub chapters_count: usize,
     pub attachments: Vec<AttachmentInfo>,
     pub tags: BTreeMap<String, String>,
 }

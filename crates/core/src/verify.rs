@@ -71,14 +71,16 @@ pub fn verify_output(
         }
     }
 
-    if let (Some(before), Some(after)) = (input.duration_ms, output_info.duration_ms) {
-        let delta = after as i64 - before as i64;
-        report.duration_delta_ms = Some(delta);
-        if delta.abs() > 2000 {
-            report.warnings.push(format!(
-                "длительность отличается на {:.1} с — проверьте файл",
-                delta as f64 / 1000.0
-            ));
+    if plan.split.is_none() && plan.append.is_empty() {
+        if let (Some(before), Some(after)) = (input.duration_ms, output_info.duration_ms) {
+            let delta = after as i64 - before as i64;
+            report.duration_delta_ms = Some(delta);
+            if delta.abs() > 2000 {
+                report.warnings.push(format!(
+                    "длительность отличается на {:.1} с — проверьте файл",
+                    delta as f64 / 1000.0
+                ));
+            }
         }
     }
 
