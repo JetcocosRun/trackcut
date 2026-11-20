@@ -1428,7 +1428,13 @@ impl App {
                                 response.on_hover_text(entry.path.display().to_string());
 
                                 if ui
-                                    .add_enabled(!busy, egui::Button::new("✕").small())
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            egui::RichText::new("✕").color(RED).small(),
+                                        ),
+                                    )
+                                    .on_hover_text("Убрать файл из списка")
                                     .clicked()
                                 {
                                     remove = Some(index);
@@ -1778,7 +1784,7 @@ impl App {
                                 .show(ui, |ui| {
                                     for header in [
                                         "", "Тип", "№", "Кодек", "Язык", "Название",
-                                        "Параметры", "Размер", "Def", "Forced", "⤓", "", "",
+                                        "Параметры", "Размер", "Def", "Forced", "Файл", "", "",
                                     ] {
                                         ui.label(RichText::new(header).strong().small());
                                     }
@@ -1882,12 +1888,24 @@ impl App {
                                         if stream.kind == StreamKind::Audio
                                             || stream.kind == StreamKind::Subtitle
                                         {
+                                            let ext = if stream.kind == StreamKind::Audio {
+                                                "mka"
+                                            } else {
+                                                "mks"
+                                            };
                                             let response = ui
-                                                .add_enabled(!busy, egui::Button::new("⤓").small())
-                                                .on_hover_text(
-                                                    "Сохранить эту дорожку отдельно (MKA/MKS), \
-                                                     чтобы потом пришить к другому файлу",
-                                                );
+                                                .add_enabled(
+                                                    !busy,
+                                                    egui::Button::new(
+                                                        egui::RichText::new(ext)
+                                                            .color(ACCENT)
+                                                            .small(),
+                                                    ),
+                                                )
+                                                .on_hover_text(format!(
+                                                    "Сохранить дорожку отдельным файлом .{ext}, \
+                                                     чтобы потом пришить к другому видео"
+                                                ));
                                             if response.clicked() {
                                                 extract_request = Some(uid);
                                             }
@@ -2138,7 +2156,12 @@ impl App {
                                     }
                                 }
                                 if ui
-                                    .add_enabled(!busy, egui::Button::new("✕").small())
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            egui::RichText::new("✕").color(RED).small(),
+                                        ),
+                                    )
                                     .on_hover_text("Убрать дорожку из результата")
                                     .clicked()
                                 {
@@ -2206,7 +2229,16 @@ impl App {
                                 .small(),
                             )
                             .on_hover_text(path.display().to_string());
-                            if ui.small_button("✕").clicked() {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✕").color(RED).small(),
+                                    )
+                                    .small(),
+                                )
+                                .on_hover_text("Убрать файл из склейки")
+                                .clicked()
+                            {
                                 append_remove = Some(index);
                             }
                         });
