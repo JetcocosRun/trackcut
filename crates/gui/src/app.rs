@@ -15,7 +15,8 @@ use trackcut_core::{
 };
 
 use crate::preview::{
-    request_frame, start_pair_preview, start_preview, FrameMsg, PreviewMsg, PreviewState,
+    request_frame, start_pair_preview, start_preview, start_video_segment, FrameMsg, PreviewMsg,
+    PreviewState, VideoFrame,
 };
 
 const ACCENT: Color32 = Color32::from_rgb(96, 165, 250);
@@ -266,6 +267,10 @@ struct SyncWindow {
     frame_for: Option<u64>,
     playing: bool,
     stop: Option<Arc<AtomicBool>>,
+    video_playing: bool,
+    video_stop: Option<Arc<AtomicBool>>,
+    video_rx: Option<Receiver<VideoFrame>>,
+    video_token: u64,
     syncing: bool,
     sync_note: Option<String>,
     status: String,
@@ -568,6 +573,42 @@ impl App {
             }
         }
 
+        // Кадры видеофрагмента: заменяют статичный кадр, пока играет звук.
+        if let Some(window) = self.sync_window.as_mut() {
+            if let Some(rx) = window.video_rx.take() {
+                let mut disconnected = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(frame) => {
+                            if frame.token != window.video_token {
+                                continue;
+                            }
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [frame.width as usize, frame.height as usize],
+                                &frame.rgba,
+                            );
+                            window.texture = Some(ctx.load_texture(
+                                "sync_video",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            window.image_size = [frame.width as f32, frame.height as f32];
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if disconnected {
+                    window.video_playing = false;
+                } else {
+                    window.video_rx = Some(rx);
+                }
+            }
+        }
+
         let mut all_done: Option<(usize, usize)> = None;
         let messages: Vec<JobMsg> = match &self.job_rx {
             Some(rx) => rx.try_iter().collect(),
@@ -646,7 +687,7 @@ impl App {
             || self
                 .sync_window
                 .as_ref()
-                .map(|window| window.playing || window.frame_pending)
+                .map(|window| window.playing || window.video_playing || window.frame_pending)
                 .unwrap_or(false)
         {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -985,6 +1026,10 @@ impl App {
             frame_for: None,
             playing: false,
             stop: None,
+            video_playing: false,
+            video_stop: None,
+            video_rx: None,
+            video_token: 0,
             syncing: false,
             sync_note: None,
             status: String::new(),
@@ -998,7 +1043,12 @@ impl App {
             if let Some(stop) = window.stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
+            if let Some(stop) = window.video_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
             window.playing = false;
+            window.video_playing = false;
+            window.video_rx = None;
         }
     }
 
@@ -1086,6 +1136,23 @@ impl App {
         };
 
         let token = SYNC_TOKEN_BASE + uid as u64;
+        let video = info
+            .streams
+            .iter()
+            .find(|stream| stream.kind == StreamKind::Video && stream.ff_index.is_some())
+            .map(|stream| {
+                let width = 640u32;
+                let height = stream
+                    .resolution
+                    .map(|(w, h)| {
+                        let scaled = (width as f64 * h as f64 / w as f64).round() as u32;
+                        (scaled.max(2) / 2) * 2
+                    })
+                    .unwrap_or(360);
+                (stream.ff_index, width, height)
+            });
+        let main_path = info.path.clone();
+
         let stop = start_pair_preview(
             self.tools.clone(),
             info,
@@ -1097,10 +1164,35 @@ impl App {
             token,
             self.preview_tx.clone(),
         );
+
+        let mut video_stop = None;
+        let mut video_rx = None;
+        let mut video_token = 0;
+        if let Some((Some(ff_index), width, height)) = video {
+            let (tx, rx) = mpsc::channel();
+            video_token = token.wrapping_add(1);
+            video_stop = Some(start_video_segment(
+                self.tools.clone(),
+                main_path,
+                ff_index,
+                at_ms,
+                width,
+                height,
+                12.0,
+                video_token,
+                tx,
+            ));
+            video_rx = Some(rx);
+        }
+
         if let Some(window) = self.sync_window.as_mut() {
             window.playing = true;
             window.stop = Some(stop);
-            window.status = "Играют обе дорожки…".to_string();
+            window.video_playing = video_rx.is_some();
+            window.video_stop = video_stop;
+            window.video_rx = video_rx;
+            window.video_token = video_token;
+            window.status = "Играют обе дорожки и видео…".to_string();
         }
     }
 
@@ -1266,14 +1358,17 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    let label = if window.playing {
+                    let label = if window.playing || window.video_playing {
                         "■ Стоп"
                     } else {
-                        "▶ Слушать вместе (12 с)"
+                        "▶ Смотреть и слушать (12 с)"
                     };
                     if ui
                         .add_enabled(has_ffmpeg, egui::Button::new(label))
-                        .on_hover_text("Одновременно играют дорожка из основного файла и внешняя")
+                        .on_hover_text(
+                            "Видео и обе дорожки играют вместе 12 секунд — видно и слышно, \
+                             как ложится сдвиг",
+                        )
                         .clicked()
                     {
                         if window.playing {

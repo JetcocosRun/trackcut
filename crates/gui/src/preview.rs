@@ -113,6 +113,94 @@ pub fn request_frame(
     });
 }
 
+/// Кадр видеофрагмента для окна синхрона.
+pub struct VideoFrame {
+    pub token: u64,
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Декодирует 12 секунд видео в rawvideo и отдаёт кадры по одному.
+/// `-re` держит реальный темп, чтобы картинка не улетала вперёд звука.
+#[allow(clippy::too_many_arguments)]
+pub fn start_video_segment(
+    tools: ToolPaths,
+    input: PathBuf,
+    ff_index: usize,
+    at_ms: u64,
+    width: u32,
+    height: u32,
+    seconds: f32,
+    token: u64,
+    tx: Sender<VideoFrame>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+
+    std::thread::spawn(move || {
+        let Ok(ffmpeg) = tools.ffmpeg() else {
+            return;
+        };
+        // Звук сначала собирается в wav (доли секунды) — чуть отстаём, чтобы стартовать вместе.
+        std::thread::sleep(Duration::from_millis(350));
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Ok(mut child) = std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error"])
+            .arg("-re")
+            .arg("-ss")
+            .arg(format!("{:.3}", at_ms as f64 / 1000.0))
+            .arg("-i")
+            .arg(&input)
+            .arg("-map")
+            .arg(format!("0:{ff_index}"))
+            .args(["-an", "-sn", "-dn"])
+            .arg("-t")
+            .arg(format!("{seconds:.2}"))
+            .arg("-vf")
+            .arg(format!("scale={width}:{height},fps=12"))
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            return;
+        };
+
+        let frame_len = (width * height * 4) as usize;
+        let mut buffer = vec![0u8; frame_len];
+        while !flag.load(Ordering::Relaxed) {
+            if std::io::Read::read_exact(&mut stdout, &mut buffer).is_err() {
+                break;
+            }
+            let frame = std::mem::replace(&mut buffer, vec![0u8; frame_len]);
+            if tx
+                .send(VideoFrame {
+                    token,
+                    rgba: frame,
+                    width,
+                    height,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+
+    stop
+}
+
 /// Играет обе дорожки одновременно, чтобы на слух подогнать сдвиг.
 #[allow(clippy::too_many_arguments)]
 pub fn start_pair_preview(
