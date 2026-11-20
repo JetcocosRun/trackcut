@@ -65,11 +65,36 @@ GUI на Rust (`eframe`/`egui`), ядро и CLI — отдельные крей
 - Интеграция с Проводником: кнопка в «Настройках» добавляет (и убирает) пункт
   «Открыть в TrackCut» в контекстное меню для MKV, MP4, MOV, WebM, AVI и TS.
 
+## Установка
+
+Готовые сборки лежат в `dist\` (и в GitHub Releases):
+
+- **`TrackCut-<версия>-setup.exe`** — обычная установка. Права администратора не нужны:
+  программа ставится в профиль пользователя (`%LOCALAPPDATA%\Programs\TrackCut`),
+  появляются ярлыки в «Пуск» (и по желанию на рабочем столе), пункт удаления в
+  «Программы и компоненты». На шаге «Дополнительно» можно сразу включить пункт
+  «Открыть в TrackCut» в меню Проводника.
+- **`TrackCut-<версия>-portable.zip`** — портативный вариант: распаковать в любую папку
+  и запустить `trackcut.exe`. Рядом лежит `portable.ini`, поэтому настройки пишутся
+  в `ui.ini` рядом с программой, а не в `%APPDATA%` — можно носить на флешке.
+
+Обе поставки уже содержат `ffmpeg`, `ffprobe`, `mkvmerge` и `mkvextract`, так что
+доустанавливать ничего не нужно. Контрольные суммы — в `dist\SHA256SUMS.txt`.
+
+Пересобрать поставку из исходников:
+
+```powershell
+.\pack.ps1               # release-сборка + ZIP + setup.exe (нужен Inno Setup 6)
+.\pack.ps1 -SkipBuild    # взять уже собранные exe из target\release
+.\pack.ps1 -NoSetup      # только портативный ZIP
+```
+
 ## Требования
 
 - Windows 10/11 x64 (приложение собрано под GNU-тулчейн, работает и без MSVC).
-- [MKVToolNix](https://mkvtoolnix.download/) — `mkvmerge` (основной бэкенд для MKV/WebM).
-- [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) — `ffmpeg` и `ffprobe` (MP4/MOV, прослушивание, проверка).
+- Для готовой поставки больше ничего не нужно: MKVToolNix (`mkvmerge`, `mkvextract`)
+  и FFmpeg (`ffmpeg`, `ffprobe`) уже лежат в `tools\` внутри архива и установщика.
+- При запуске из исходников положите их в `tools\` (см. ниже).
 
 Приложение ищет `ffmpeg.exe`, `ffprobe.exe`, `mkvmerge.exe`:
 

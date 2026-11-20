@@ -7,3 +7,5 @@
 /demo/*.wav
 /demo/*.png
 *.log
+
+/dist
