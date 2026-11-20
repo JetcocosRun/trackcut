@@ -3022,17 +3022,30 @@ impl App {
                                             let shiftable = stream.kind == StreamKind::Audio
                                                 || stream.kind == StreamKind::Subtitle;
                                             if shiftable {
-                                                let label = if delay == 0 {
-                                                    "сдвиг".to_string()
+                                                let shifted = delay != 0;
+                                                let label = if shifted {
+                                                    format!("сдвиг {delay:+}")
                                                 } else {
-                                                    format!("{delay:+} мс")
+                                                    "сдвиг".to_string()
+                                                };
+                                                let button = egui::Button::new(label).small();
+                                                let button = if shifted {
+                                                    button.fill(ACCENT.gamma_multiply(0.35))
+                                                } else {
+                                                    button
                                                 };
                                                 if ui
-                                                    .add(egui::Button::new(label).small())
-                                                    .on_hover_text(
+                                                    .add(button)
+                                                    .on_hover_text(if shifted {
+                                                        format!(
+                                                            "Дорожка сдвинута на {delay:+} мс. \
+                                                             Открыть окно синхрона"
+                                                        )
+                                                    } else {
                                                         "Окно синхрона: кадр из видео и сдвиг этой \
-                                                         дорожки относительно остальных",
-                                                    )
+                                                         дорожки относительно остальных"
+                                                            .to_string()
+                                                    })
                                                     .clicked()
                                                 {
                                                     sync_internal = Some(uid);
