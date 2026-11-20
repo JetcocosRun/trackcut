@@ -2417,7 +2417,7 @@ impl App {
 
                         for (track_index, track) in extra.tracks.iter_mut().enumerate() {
                             let stream = extra.info.streams.get(track.uid).cloned();
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let Some(stream) = &stream else {
                                     ui.label(
                                         RichText::new("дорожка не найдена в файле")
@@ -2436,13 +2436,13 @@ impl App {
                                     .small(),
                                 );
                                 ui.label(RichText::new(stream.codec_display()).small());
-                                ui.label(
-                                    RichText::new(truncate_chars(
-                                        &trackcut_core::extract::track_caption(stream),
-                                        46,
-                                    ))
-                                    .small(),
-                                );
+                                    ui.label(
+                                        RichText::new(truncate_chars(
+                                            &trackcut_core::extract::track_caption(stream),
+                                            30,
+                                        ))
+                                        .small(),
+                                    );
                                 ui.label(RichText::new("сдвиг").small().color(MUTED));
                                 ui.add(
                                     egui::DragValue::new(&mut track.delay_ms)
@@ -2483,7 +2483,7 @@ impl App {
                                         extra_preview = Some((source_index, track_index));
                                     }
                                     if ui
-                                        .add_enabled(!busy, egui::Button::new("🎬").small())
+                                        .add_enabled(!busy, egui::Button::new("кадр").small())
                                         .on_hover_text(
                                             "Окно синхрона: кадр из видео, обе дорожки вместе \
                                              и подгонка сдвига",
