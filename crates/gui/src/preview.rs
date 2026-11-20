@@ -90,3 +90,79 @@ fn play_wav(path: &PathBuf, stop: &AtomicBool) -> Result<(), String> {
     sink.stop();
     Ok(())
 }
+
+/// Кадр для окна синхрона: грузится в фоне, чтобы не подвешивать интерфейс.
+pub struct FrameMsg {
+    pub token: u64,
+    pub result: Result<(Vec<u8>, u32, u32), String>,
+}
+
+pub fn request_frame(
+    tools: ToolPaths,
+    input: PathBuf,
+    ff_index: usize,
+    at_ms: u64,
+    width: u32,
+    token: u64,
+    tx: Sender<FrameMsg>,
+) {
+    std::thread::spawn(move || {
+        let result = trackcut_core::preview::extract_frame(&tools, &input, ff_index, at_ms, width)
+            .map_err(|err| err.to_string());
+        let _ = tx.send(FrameMsg { token, result });
+    });
+}
+
+/// Играет обе дорожки одновременно, чтобы на слух подогнать сдвиг.
+#[allow(clippy::too_many_arguments)]
+pub fn start_pair_preview(
+    tools: ToolPaths,
+    main: MediaInfo,
+    main_ff: usize,
+    extra: MediaInfo,
+    extra_ff: usize,
+    at_ms: u64,
+    delay_ms: i64,
+    token: u64,
+    tx: Sender<PreviewMsg>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+
+    std::thread::spawn(move || {
+        let temp: PathBuf = std::env::temp_dir().join(format!(
+            "trackcut_pair_{}_{}.wav",
+            std::process::id(),
+            token
+        ));
+
+        if let Err(err) = trackcut_core::preview::extract_pair_preview(
+            &tools,
+            &main.path,
+            main_ff,
+            &extra.path,
+            extra_ff,
+            at_ms,
+            delay_ms,
+            12.0,
+            &temp,
+        ) {
+            let _ = std::fs::remove_file(&temp);
+            let _ = tx.send(PreviewMsg::Error(token, err.to_string()));
+            return;
+        }
+
+        match play_wav(&temp, &flag) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temp);
+                let _ = tx.send(PreviewMsg::Finished(token));
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                let _ = tx.send(PreviewMsg::Error(token, err));
+            }
+        }
+    });
+
+    stop
+}
