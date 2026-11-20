@@ -7,6 +7,21 @@ use std::time::Duration;
 use trackcut_core::preview::{extract_preview, preview_start_ms};
 use trackcut_core::{MediaInfo, ToolPaths};
 
+/// Запускает консольную утилиту без мелькающего окна терминала.
+#[cfg(windows)]
+fn hidden_command(program: PathBuf) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn hidden_command(program: PathBuf) -> std::process::Command {
+    std::process::Command::new(program)
+}
+
 pub enum PreviewMsg {
     Finished(u64),
     Error(u64, String),
@@ -148,7 +163,7 @@ pub fn start_video_segment(
             return;
         }
 
-        let Ok(mut child) = std::process::Command::new(ffmpeg)
+        let Ok(mut child) = hidden_command(ffmpeg)
             .args(["-hide_banner", "-nostdin", "-loglevel", "error"])
             .arg("-re")
             .arg("-ss")
