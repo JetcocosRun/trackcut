@@ -3948,8 +3948,20 @@ fn truncate_chars(value: &str, max: usize) -> String {
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let font_path = |name: &str| format!("{windir}\\Fonts\\{name}");
 
-    if let Ok(bytes) = std::fs::read(format!("{windir}\\Fonts\\segoeui.ttf")) {
+    // Шрифты, которых нет в egui по умолчанию: кириллица (в том числе казахские
+    // буквы), китайские, японские и корейские иероглифы. Отсутствующие файлы
+    // просто пропускаются — приложение продолжит работать на встроенном шрифте.
+    const FALLBACKS: &[(&str, &str)] = &[
+        ("msyh", "msyh.ttc"),
+        ("simsun", "simsun.ttc"),
+        ("meiryo", "meiryo.ttc"),
+        ("yugothic", "YuGothR.ttc"),
+        ("malgun", "malgun.ttf"),
+    ];
+
+    if let Ok(bytes) = std::fs::read(font_path("segoeui.ttf")) {
         fonts.font_data.insert(
             "segoe".to_string(),
             egui::FontData::from_owned(bytes).into(),
@@ -3958,13 +3970,28 @@ fn install_fonts(ctx: &egui::Context) {
             family.insert(0, "segoe".to_string());
         }
     }
-    if let Ok(bytes) = std::fs::read(format!("{windir}\\Fonts\\consola.ttf")) {
+    if let Ok(bytes) = std::fs::read(font_path("consola.ttf")) {
         fonts.font_data.insert(
             "consolas".to_string(),
             egui::FontData::from_owned(bytes).into(),
         );
         if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
             family.insert(0, "consolas".to_string());
+        }
+    }
+
+    for (name, file) in FALLBACKS {
+        let Ok(bytes) = std::fs::read(font_path(file)) else {
+            continue;
+        };
+        fonts.font_data.insert(
+            (*name).to_string(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(list) = fonts.families.get_mut(&family) {
+                list.push((*name).to_string());
+            }
         }
     }
 
