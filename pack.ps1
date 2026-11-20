@@ -72,6 +72,8 @@ CopyRequired (Join-Path $root "target\release\trackcut.exe") (Join-Path $stage "
 CopyRequired (Join-Path $root "target\release\trackcut-cli.exe") (Join-Path $stage "trackcut-cli.exe")
 CopyRequired (Join-Path $root "README.md") (Join-Path $stage "README.md")
 CopyRequired (Join-Path $root "installer\THIRD-PARTY-NOTICES.txt") (Join-Path $stage "THIRD-PARTY-NOTICES.txt")
+CopyRequired (Join-Path $root "LICENSE-MIT") (Join-Path $stage "LICENSE-MIT")
+CopyRequired (Join-Path $root "LICENSE-APACHE") (Join-Path $stage "LICENSE-APACHE")
 
 CopyRequired (Join-Path $root "tools\ffmpeg\bin\ffmpeg.exe") (Join-Path $stage "tools\ffmpeg\bin\ffmpeg.exe")
 CopyRequired (Join-Path $root "tools\ffmpeg\bin\ffprobe.exe") (Join-Path $stage "tools\ffmpeg\bin\ffprobe.exe")
