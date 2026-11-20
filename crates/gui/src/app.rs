@@ -1665,10 +1665,6 @@ impl App {
             let mut append_pick = false;
             let mut append_remove: Option<usize> = None;
 
-            egui::ScrollArea::vertical()
-                .id_salt("center_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
             let file_size;
             {
                 let entry = &mut self.files[self.selected];
@@ -1774,194 +1770,9 @@ impl App {
                 });
 
                 ui.add_space(4.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("tracks")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            egui::Grid::new("track_grid")
-                                .striped(true)
-                                .num_columns(13)
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    for header in [
-                                        "", "Тип", "№", "Кодек", "Язык", "Название",
-                                        "Параметры", "Размер", "Def", "Forced", "Файл", "", "",
-                                    ] {
-                                        ui.label(RichText::new(header).strong().small());
-                                    }
-                                    ui.end_row();
-
-                                    for (uid, stream) in info.streams.iter().enumerate() {
-                                        let haystack = format!(
-                                            "{} {} {} {}",
-                                            stream.display_name(),
-                                            stream.language_label(),
-                                            stream.codec_display(),
-                                            stream.kind.label_ru()
-                                        )
-                                        .to_ascii_lowercase();
-                                        if !filter.is_empty() && !haystack.contains(&filter) {
-                                            continue;
-                                        }
-
-                                        let selectable = stream.kind.is_selectable();
-                                        let is_kept =
-                                            entry.keep.get(uid).copied().unwrap_or(false);
-
-                                        ui.add_enabled(
-                                            selectable,
-                                            egui::Checkbox::without_text(&mut entry.keep[uid]),
-                                        );
-
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{} {}",
-                                                stream.kind.icon(),
-                                                stream.kind.label_ru()
-                                            ))
-                                            .color(kind_color(stream.kind))
-                                            .small(),
-                                        );
-
-                                        ui.label(
-                                            RichText::new(format!("{}", uid + 1))
-                                                .small()
-                                                .color(MUTED),
-                                        );
-
-                                        ui.label(stream.codec_display());
-
-                                        ui.label(stream.language_label());
-
-                                        let (name_text, color) = if stream.has_name() {
-                                            (stream.display_name().to_string(), Color32::WHITE)
-                                        } else {
-                                            ("Без названия".to_string(), MUTED)
-                                        };
-                                        ui.label(
-                                            RichText::new(truncate_chars(&name_text, 34))
-                                                .color(color),
-                                        )
-                                        .on_hover_text(name_text);
-
-                                        ui.label(
-                                            RichText::new(params_for(stream))
-                                                .small()
-                                                .color(MUTED),
-                                        );
-
-                                        let size = stream
-                                            .effective_size(info.duration_ms)
-                                            .map(|bytes| {
-                                                let percent = if file_size > 0 {
-                                                    bytes as f64 / file_size as f64 * 100.0
-                                                } else {
-                                                    0.0
-                                                };
-                                                let approx = if stream.size_bytes.is_none()
-                                                    && stream.bitrate.is_some()
-                                                {
-                                                    "≈"
-                                                } else {
-                                                    ""
-                                                };
-                                                format!(
-                                                    "{approx}{} ({percent:.1}%)",
-                                                    format_size(bytes)
-                                                )
-                                            })
-                                            .unwrap_or_default();
-                                        ui.label(RichText::new(size).small());
-
-                                        ui.add_enabled(
-                                            selectable && is_kept,
-                                            egui::Checkbox::without_text(
-                                                &mut entry.default_flag[uid],
-                                            ),
-                                        );
-                                        ui.add_enabled(
-                                            selectable && is_kept,
-                                            egui::Checkbox::without_text(
-                                                &mut entry.forced_flag[uid],
-                                            ),
-                                        );
-
-                                        if stream.kind == StreamKind::Audio
-                                            || stream.kind == StreamKind::Subtitle
-                                        {
-                                            let ext = if stream.kind == StreamKind::Audio {
-                                                "mka"
-                                            } else {
-                                                "mks"
-                                            };
-                                            let response = ui
-                                                .add_enabled(
-                                                    !busy,
-                                                    egui::Button::new(
-                                                        egui::RichText::new(ext)
-                                                            .color(ACCENT)
-                                                            .small(),
-                                                    ),
-                                                )
-                                                .on_hover_text(format!(
-                                                    "Сохранить дорожку отдельным файлом .{ext}, \
-                                                     чтобы потом пришить к другому видео"
-                                                ));
-                                            if response.clicked() {
-                                                extract_request = Some(uid);
-                                            }
-                                        } else {
-                                            ui.label("");
-                                        }
-
-                                        if stream.kind == StreamKind::Audio
-                                            && stream.ff_index.is_some()
-                                        {
-                                            let playing = preview_token == Some(main_token(uid));
-                                            let label = if playing { "■" } else { "▶" };
-                                            let response = ui
-                                                .add(egui::Button::new(label).small())
-                                                .on_hover_text(
-                                                    "Прослушать 15 секунд этой дорожки",
-                                                );
-                                            if response.clicked() {
-                                                preview_request = Some(uid);
-                                            }
-                                        } else {
-                                            ui.label("");
-                                        }
-
-                                        if ui
-                                            .add(egui::Button::new("🏷").small())
-                                            .on_hover_text("Все теги дорожки")
-                                            .clicked()
-                                        {
-                                            tags_request = Some(uid);
-                                        }
-
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                });
-
-                let container = self.output_container.resolve(&entry.path);
-                if container.is_mp4_family()
-                    && info.streams.iter().enumerate().any(|(uid, s)| {
-                        entry.keep.get(uid).copied().unwrap_or(false)
-                            && s.kind == StreamKind::Subtitle
-                            && s.is_text_subtitle()
-                    })
-                    && !self.mov_text
-                {
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        ORANGE,
-                        "Для MP4 текст субтитров нужно конвертировать в MOV text — включите опцию слева.",
-                    );
-                }
-
+                egui::TopBottomPanel::bottom("center_lower")
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2216,6 +2027,10 @@ impl App {
                         .color(MUTED),
                     );
                 } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("append_scroll")
+                        .max_height(96.0)
+                        .show(ui, |ui| {
                     for (index, path) in entry.append.iter().enumerate() {
                         let name = path
                             .file_name()
@@ -2245,6 +2060,198 @@ impl App {
                             }
                         });
                     }
+                        });
+                }
+                    });
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    let table_height = ui.available_height().max(120.0);
+                    egui::ScrollArea::both()
+                        .id_salt("tracks")
+                        .auto_shrink([false, false])
+                        .max_height(table_height)
+                        .show(ui, |ui| {
+                            egui::Grid::new("track_grid")
+                                .striped(true)
+                                .num_columns(13)
+                                .spacing([10.0, 6.0])
+                                .show(ui, |ui| {
+                                    for header in [
+                                        "", "Тип", "№", "Кодек", "Язык", "Название",
+                                        "Параметры", "Размер", "Def", "Forced", "Файл", "", "",
+                                    ] {
+                                        ui.label(RichText::new(header).strong().small());
+                                    }
+                                    ui.end_row();
+
+                                    for (uid, stream) in info.streams.iter().enumerate() {
+                                        let haystack = format!(
+                                            "{} {} {} {}",
+                                            stream.display_name(),
+                                            stream.language_label(),
+                                            stream.codec_display(),
+                                            stream.kind.label_ru()
+                                        )
+                                        .to_ascii_lowercase();
+                                        if !filter.is_empty() && !haystack.contains(&filter) {
+                                            continue;
+                                        }
+
+                                        let selectable = stream.kind.is_selectable();
+                                        let is_kept =
+                                            entry.keep.get(uid).copied().unwrap_or(false);
+
+                                        ui.add_enabled(
+                                            selectable,
+                                            egui::Checkbox::without_text(&mut entry.keep[uid]),
+                                        );
+
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} {}",
+                                                stream.kind.icon(),
+                                                stream.kind.label_ru()
+                                            ))
+                                            .color(kind_color(stream.kind))
+                                            .small(),
+                                        );
+
+                                        ui.label(
+                                            RichText::new(format!("{}", uid + 1))
+                                                .small()
+                                                .color(MUTED),
+                                        );
+
+                                        ui.label(stream.codec_display());
+
+                                        ui.label(stream.language_label());
+
+                                        let (name_text, color) = if stream.has_name() {
+                                            (stream.display_name().to_string(), Color32::WHITE)
+                                        } else {
+                                            ("Без названия".to_string(), MUTED)
+                                        };
+                                        ui.label(
+                                            RichText::new(truncate_chars(&name_text, 34))
+                                                .color(color),
+                                        )
+                                        .on_hover_text(name_text);
+
+                                        ui.label(
+                                            RichText::new(params_for(stream))
+                                                .small()
+                                                .color(MUTED),
+                                        );
+
+                                        let size = stream
+                                            .effective_size(info.duration_ms)
+                                            .map(|bytes| {
+                                                let percent = if file_size > 0 {
+                                                    bytes as f64 / file_size as f64 * 100.0
+                                                } else {
+                                                    0.0
+                                                };
+                                                let approx = if stream.size_bytes.is_none()
+                                                    && stream.bitrate.is_some()
+                                                {
+                                                    "≈"
+                                                } else {
+                                                    ""
+                                                };
+                                                format!(
+                                                    "{approx}{} ({percent:.1}%)",
+                                                    format_size(bytes)
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        ui.label(RichText::new(size).small());
+
+                                        ui.add_enabled(
+                                            selectable && is_kept,
+                                            egui::Checkbox::without_text(
+                                                &mut entry.default_flag[uid],
+                                            ),
+                                        );
+                                        ui.add_enabled(
+                                            selectable && is_kept,
+                                            egui::Checkbox::without_text(
+                                                &mut entry.forced_flag[uid],
+                                            ),
+                                        );
+
+                                        if stream.kind == StreamKind::Audio
+                                            || stream.kind == StreamKind::Subtitle
+                                        {
+                                            let ext = if stream.kind == StreamKind::Audio {
+                                                "mka"
+                                            } else {
+                                                "mks"
+                                            };
+                                            let response = ui
+                                                .add_enabled(
+                                                    !busy,
+                                                    egui::Button::new(
+                                                        egui::RichText::new(ext)
+                                                            .color(ACCENT)
+                                                            .small(),
+                                                    ),
+                                                )
+                                                .on_hover_text(format!(
+                                                    "Сохранить дорожку отдельным файлом .{ext}, \
+                                                     чтобы потом пришить к другому видео"
+                                                ));
+                                            if response.clicked() {
+                                                extract_request = Some(uid);
+                                            }
+                                        } else {
+                                            ui.label("");
+                                        }
+
+                                        if stream.kind == StreamKind::Audio
+                                            && stream.ff_index.is_some()
+                                        {
+                                            let playing = preview_token == Some(main_token(uid));
+                                            let label = if playing { "■" } else { "▶" };
+                                            let response = ui
+                                                .add(egui::Button::new(label).small())
+                                                .on_hover_text(
+                                                    "Прослушать 15 секунд этой дорожки",
+                                                );
+                                            if response.clicked() {
+                                                preview_request = Some(uid);
+                                            }
+                                        } else {
+                                            ui.label("");
+                                        }
+
+                                        if ui
+                                            .add(egui::Button::new("🏷").small())
+                                            .on_hover_text("Все теги дорожки")
+                                            .clicked()
+                                        {
+                                            tags_request = Some(uid);
+                                        }
+
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+
+                let container = self.output_container.resolve(&entry.path);
+                if container.is_mp4_family()
+                    && info.streams.iter().enumerate().any(|(uid, s)| {
+                        entry.keep.get(uid).copied().unwrap_or(false)
+                            && s.kind == StreamKind::Subtitle
+                            && s.is_text_subtitle()
+                    })
+                    && !self.mov_text
+                {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        ORANGE,
+                        "Для MP4 текст субтитров нужно конвертировать в MOV text — включите опцию слева.",
+                    );
                 }
             }
 
@@ -2304,7 +2311,6 @@ impl App {
                 }
                 self.status = "Файл убран из склейки".into();
             }
-                });
         });
     }
 
