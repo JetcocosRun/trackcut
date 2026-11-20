@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod config;
 mod i18n;
 mod preview;
 
@@ -21,12 +22,23 @@ fn main() -> eframe::Result<()> {
         height: 128,
     };
 
+    // Размер и позицию окна берём из прошлого запуска.
+    let saved = config::Settings::load();
+    let (width, height) = saved
+        .window
+        .map(|(_, _, width, height)| (width, height))
+        .unwrap_or((1320.0, 860.0));
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([width.max(1040.0), height.max(640.0)])
+        .with_min_inner_size([1040.0, 640.0])
+        .with_icon(icon)
+        .with_title("TrackCut");
+    if let Some((x, y, _, _)) = saved.window {
+        viewport = viewport.with_position([x, y]);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1320.0, 860.0])
-            .with_min_inner_size([1040.0, 640.0])
-            .with_icon(icon)
-            .with_title("TrackCut"),
+        viewport,
         ..Default::default()
     };
 

@@ -1,4 +1,5 @@
 pub mod chapters;
+pub mod disk;
 pub mod error;
 pub mod exec;
 pub mod extract;

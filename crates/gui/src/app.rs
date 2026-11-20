@@ -5,7 +5,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::process::Command;
+
 use eframe::egui::{self, Align, Color32, Layout, RichText};
+use serde::{Deserialize, Serialize};
 use trackcut_core::extract::{default_track_path, ExtractContainer, ExtractPlan};
 use trackcut_core::model::{format_duration, format_size, OutputContainer, StreamInfo, StreamKind};
 use trackcut_core::plan::{parse_ranges, paths_equal, validate, SplitSpec};
@@ -14,7 +20,8 @@ use trackcut_core::{
     KeepTrack, MediaInfo, MuxPlan, OffsetEstimate, ToolPaths,
 };
 
-use crate::i18n::{save_lang, tr, Lang};
+use crate::config::{self, Settings};
+use crate::i18n::{tr, Lang};
 use crate::preview::{
     request_frame, start_pair_preview, start_preview, start_track_preview, start_video_segment,
     FrameMsg, PreviewMsg, PreviewState, VideoFrame,
@@ -114,6 +121,51 @@ struct ExtraPick {
     selected: Vec<bool>,
 }
 
+/// Файл в сохранённом проекте: отметки дорожек и пришитые источники.
+#[derive(Serialize, Deserialize)]
+struct ProjectFile {
+    path: String,
+    #[serde(default = "default_true")]
+    include: bool,
+    #[serde(default)]
+    keep: Vec<bool>,
+    #[serde(default)]
+    default_flag: Vec<bool>,
+    #[serde(default)]
+    forced_flag: Vec<bool>,
+    #[serde(default)]
+    keep_delay: Vec<i64>,
+    #[serde(default)]
+    extras: Vec<ProjectTrackSpec>,
+    #[serde(default)]
+    chapters_file: Option<String>,
+    #[serde(default)]
+    append: Vec<String>,
+}
+
+/// Дорожка из чужого файла, пришитая к файлу проекта.
+#[derive(Clone, Serialize, Deserialize)]
+struct ProjectTrackSpec {
+    path: String,
+    uid: usize,
+    #[serde(default)]
+    delay_ms: i64,
+    #[serde(default)]
+    default: bool,
+}
+
+/// Проект: список файлов с отметками. Пишется в `.trackcut` (JSON).
+#[derive(Serialize, Deserialize)]
+struct Project {
+    #[serde(default)]
+    version: u32,
+    files: Vec<ProjectFile>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 struct FileEntry {
     path: PathBuf,
     info: Option<MediaInfo>,
@@ -186,6 +238,13 @@ enum ProbeMsg {
         uid: usize,
         internal: bool,
         result: Result<OffsetEstimate, String>,
+    },
+    /// Готовы метаданные внешней дорожки, восстанавливаемой из проекта.
+    ProjectExtra {
+        file_index: usize,
+        path: PathBuf,
+        tracks: Vec<ProjectTrackSpec>,
+        result: Result<MediaInfo, String>,
     },
 }
 
@@ -328,12 +387,24 @@ pub struct App {
 
     log: Vec<String>,
     status: String,
+
+    /// Сохранённые настройки: что сейчас на панелях и что уже записано на диск.
+    cfg: Settings,
+    cfg_saved: Settings,
+    cfg_checked_at: f64,
+    /// Куда писались последние файлы — для кнопки «Открыть папку с результатом».
+    last_outputs: Vec<PathBuf>,
+    /// Проект: флаги, которые нужно применить, когда файл прочитается.
+    pending_restore: Vec<(PathBuf, ProjectFile)>,
+    /// Установлено ли меню Проводника (None — ещё не проверяли).
+    shell_menu: Option<bool>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
-        setup_style(&cc.egui_ctx);
+        let cfg = Settings::load();
+        setup_style(&cc.egui_ctx, &cfg.theme);
         trackcut_core::chapters::cleanup_temp();
 
         let tools = ToolPaths::detect();
@@ -342,7 +413,7 @@ impl App {
         let (preview_tx, preview_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::channel();
 
-        let lang = crate::i18n::load_lang();
+        let lang = cfg.lang;
         let mut app = Self {
             tools,
             tool_versions,
@@ -351,17 +422,17 @@ impl App {
             probe_tx,
             probe_rx,
             probe_pending: 0,
-            output_container: ContainerChoice::Auto,
-            output_dir: None,
-            suffix: "_clean".to_string(),
-            keep_chapters: true,
-            keep_tags: true,
-            keep_attachments: true,
-            mov_text: false,
-            overwrite: false,
-            split: SplitChoice::None,
-            split_minutes: 10.0,
-            split_ranges: String::new(),
+            output_container: container_from_code(&cfg.container),
+            output_dir: cfg.output_dir.clone(),
+            suffix: cfg.suffix.clone(),
+            keep_chapters: cfg.keep_chapters,
+            keep_tags: cfg.keep_tags,
+            keep_attachments: cfg.keep_attachments,
+            mov_text: cfg.mov_text,
+            overwrite: cfg.overwrite,
+            split: split_from_code(&cfg.split),
+            split_minutes: cfg.split_minutes,
+            split_ranges: cfg.split_ranges.clone(),
             lang,
             filter: String::new(),
             tags_open: None,
@@ -377,6 +448,12 @@ impl App {
             frame_rx,
             log: Vec::new(),
             status: tr(lang, "Добавьте файл, чтобы увидеть дорожки").to_string(),
+            cfg_saved: cfg.clone(),
+            cfg,
+            cfg_checked_at: 0.0,
+            last_outputs: Vec::new(),
+            pending_restore: Vec::new(),
+            shell_menu: None,
         };
 
         if let Some(arg) = std::env::args().nth(1) {
@@ -473,6 +550,15 @@ impl App {
         let probe_messages: Vec<ProbeMsg> = self.probe_rx.try_iter().collect();
         for message in probe_messages {
             let (id, result) = match message {
+                ProbeMsg::ProjectExtra {
+                    file_index,
+                    path,
+                    tracks,
+                    result,
+                } => {
+                    self.apply_project_extra(file_index, &path, tracks, result);
+                    continue;
+                }
                 ProbeMsg::Done(id, result) => (id, result),
                 ProbeMsg::ExtraPick(result) => {
                     if let Some(pick) = &mut self.extra_pick {
@@ -510,6 +596,83 @@ impl App {
                     entry.error = None;
                     entry.info = Some(info);
                     entry.reset_flags();
+                    // Проект: вернуть отметки, главы и склейку из сохранённого файла.
+                    let path = entry.path.clone();
+                    if let Some(pos) = self
+                        .pending_restore
+                        .iter()
+                        .position(|(target, _)| paths_equal(target, &path))
+                    {
+                        let (_, file) = self.pending_restore.remove(pos);
+                        entry.include = file.include;
+                        if file.keep.len() == entry.keep.len() {
+                            entry.keep = file.keep;
+                        }
+                        if file.default_flag.len() == entry.default_flag.len() {
+                            entry.default_flag = file.default_flag;
+                        }
+                        if file.forced_flag.len() == entry.forced_flag.len() {
+                            entry.forced_flag = file.forced_flag;
+                        }
+                        if file.keep_delay.len() == entry.keep_delay.len() {
+                            entry.keep_delay = file.keep_delay;
+                        }
+                        if let Some(text) = file.chapters_file {
+                            let chapters = PathBuf::from(&text);
+                            if chapters.is_file() {
+                                entry.chapters_label = Some(
+                                    chapters
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| chapters.display().to_string()),
+                                );
+                                entry.chapters_file = Some(chapters);
+                            }
+                        }
+                        for text in file.append {
+                            let appended = PathBuf::from(&text);
+                            if !appended.is_file() {
+                                continue;
+                            }
+                            if entry
+                                .append
+                                .iter()
+                                .any(|existing| paths_equal(existing, &appended))
+                            {
+                                continue;
+                            }
+                            entry.append.push(appended);
+                        }
+                        // Внешние дорожки: сначала читаем их метаданные.
+                        let mut grouped: Vec<(PathBuf, Vec<ProjectTrackSpec>)> = Vec::new();
+                        for spec in file.extras {
+                            let extra_path = PathBuf::from(&spec.path);
+                            if !extra_path.is_file() {
+                                continue;
+                            }
+                            match grouped
+                                .iter_mut()
+                                .find(|(target, _)| paths_equal(target, &extra_path))
+                            {
+                                Some((_, list)) => list.push(spec),
+                                None => grouped.push((extra_path, vec![spec])),
+                            }
+                        }
+                        for (extra_path, tracks) in grouped {
+                            let tx = self.probe_tx.clone();
+                            let tools = self.tools.clone();
+                            std::thread::spawn(move || {
+                                let result = probe::probe(&extra_path, &tools)
+                                    .map_err(|err| err.to_string());
+                                let _ = tx.send(ProbeMsg::ProjectExtra {
+                                    file_index: id,
+                                    path: extra_path,
+                                    tracks,
+                                    result,
+                                });
+                            });
+                        }
+                    }
                     if entry.file_size == 0 {
                         entry.file_size =
                             std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
@@ -678,6 +841,11 @@ impl App {
                     } else {
                         format!("✘ {message}")
                     });
+                    if ok {
+                        if let Some(path) = &output {
+                            self.last_outputs.push(PathBuf::from(path));
+                        }
+                    }
                     if ok && mark_result {
                         if let Some(entry) = self.files.get_mut(file_index) {
                             entry.result = output;
@@ -706,6 +874,13 @@ impl App {
             self.log.push(self.status.clone());
             if let Some(rx) = &self.job_rx {
                 let _ = rx;
+            }
+            let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+            if self.cfg.notify && !focused {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+                beep();
             }
             ctx.request_repaint();
         }
@@ -881,6 +1056,10 @@ impl App {
                 return;
             }
         };
+        if let Some(problem) = self.check_disk_space(&jobs) {
+            self.status = problem;
+            return;
+        }
         let total = jobs.len();
         self.start_jobs(jobs, format!("{}: {total}", tr(self.lang, "Сборка")));
     }
@@ -2102,11 +2281,262 @@ impl eframe::App for App {
         self.show_tags(ctx);
         self.show_extra_picker(ctx);
         self.show_drop_overlay(ctx);
+        self.save_settings_if_changed(ctx);
+    }
+}
+
+impl App {
+    /// Снимок настроек для записи в `ui.ini`.
+    fn settings(&self, window: Option<(f32, f32, f32, f32)>) -> Settings {
+        Settings {
+            lang: self.lang,
+            container: container_code(self.output_container).to_string(),
+            output_dir: self.output_dir.clone(),
+            suffix: self.suffix.clone(),
+            keep_chapters: self.keep_chapters,
+            keep_tags: self.keep_tags,
+            keep_attachments: self.keep_attachments,
+            mov_text: self.mov_text,
+            overwrite: self.overwrite,
+            split: split_code(self.split).to_string(),
+            split_minutes: self.split_minutes,
+            split_ranges: self.split_ranges.clone(),
+            theme: self.cfg.theme.clone(),
+            notify: self.cfg.notify,
+            window: window.or(self.cfg.window),
+        }
+    }
+
+    /// Размер и место окна на экране (x, y, ширина, высота).
+    fn window_rect(&self, ctx: &egui::Context) -> Option<(f32, f32, f32, f32)> {
+        ctx.input(|input| {
+            let info = input.viewport();
+            let inner = info.inner_rect?;
+            if inner.width() < 400.0 || inner.height() < 300.0 {
+                return None;
+            }
+            let outer = info.outer_rect.unwrap_or(inner);
+            Some((outer.min.x, outer.min.y, inner.width(), inner.height()))
+        })
+    }
+
+    /// Пишет настройки, если они изменились (не чаще раза в две секунды).
+    fn save_settings_if_changed(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let window = self.window_rect(ctx);
+        let current = self.settings(window);
+        if current == self.cfg_saved {
+            return;
+        }
+        // Изменения есть. Пишем не чаще раза в две секунды и просим перерисовку:
+        // иначе последнее изменение может остаться несохранённым, если после
+        // клика ввода больше не было.
+        if self.cfg_checked_at > 0.0 && now - self.cfg_checked_at < 2.0 {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        self.cfg_checked_at = now;
+        current.save();
+        self.cfg = current.clone();
+        self.cfg_saved = current;
+    }
+
+    /// Проверяет, хватит ли места рядом с результатом. None — всё в порядке.
+    fn check_disk_space(&self, jobs: &[Job]) -> Option<String> {
+        let mut needed = 0u64;
+        let mut dir: Option<PathBuf> = None;
+        for job in jobs {
+            let JobOp::Mux { plan, .. } = &job.op else {
+                continue;
+            };
+            if let Some(entry) = self.files.get(job.file_index) {
+                needed += total_kept_bytes(entry);
+            }
+            for path in &plan.append {
+                needed += std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            }
+            if dir.is_none() {
+                dir = plan.output.parent().map(Path::to_path_buf);
+            }
+        }
+        let free = trackcut_core::disk::free_bytes(dir.as_deref()?)?;
+        // Небольшой запас: контейнерные заголовки, главы, пришитые дорожки.
+        let needed = needed + needed / 50 + 64 * 1024 * 1024;
+        if free >= needed {
+            return None;
+        }
+        Some(format!(
+            "{}: {} · {}: {}",
+            tr(self.lang, "Недостаточно места на диске"),
+            human_bytes(needed),
+            tr(self.lang, "свободно"),
+            human_bytes(free)
+        ))
+    }
+
+    /// Перекрашивает интерфейс под выбранную тему.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        setup_style(ctx, &self.cfg.theme);
+    }
+
+    /// Добавляет во файл внешнюю дорожку, восстановленную из проекта.
+    fn apply_project_extra(
+        &mut self,
+        file_index: usize,
+        path: &Path,
+        specs: Vec<ProjectTrackSpec>,
+        result: Result<MediaInfo, String>,
+    ) {
+        let Ok(info) = result else {
+            self.log.push(format!(
+                "  ! {}: {}",
+                tr(self.lang, "Внешняя дорожка убрана"),
+                path.display()
+            ));
+            return;
+        };
+        let Some(entry) = self.files.get_mut(file_index) else {
+            return;
+        };
+        if entry
+            .extras
+            .iter()
+            .any(|extra| paths_equal(&extra.info.path, path))
+        {
+            return;
+        }
+        let mut tracks = Vec::new();
+        for spec in specs {
+            if info.streams.get(spec.uid).is_none() {
+                continue;
+            }
+            tracks.push(ExtraTrackUi {
+                uid: spec.uid,
+                delay_ms: spec.delay_ms,
+                default: spec.default,
+                syncing: false,
+                sync_note: None,
+            });
+        }
+        entry.extras.push(ExtraSource { info, tracks });
+    }
+
+    /// Сохраняет список файлов с отметками в `.trackcut` (JSON).
+    fn save_project(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let files: Vec<ProjectFile> = self
+            .files
+            .iter()
+            .map(|entry| {
+                let mut extras = Vec::new();
+                for extra in &entry.extras {
+                    for track in &extra.tracks {
+                        extras.push(ProjectTrackSpec {
+                            path: extra.info.path.display().to_string(),
+                            uid: track.uid,
+                            delay_ms: track.delay_ms,
+                            default: track.default,
+                        });
+                    }
+                }
+                ProjectFile {
+                    path: entry.path.display().to_string(),
+                    include: entry.include,
+                    keep: entry.keep.clone(),
+                    default_flag: entry.default_flag.clone(),
+                    forced_flag: entry.forced_flag.clone(),
+                    keep_delay: entry.keep_delay.clone(),
+                    extras,
+                    chapters_file: entry
+                        .chapters_file
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    append: entry
+                        .append
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                }
+            })
+            .collect();
+        let project = Project { version: 1, files };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(tr(self.lang, "Проект TrackCut"), &["trackcut", "json"])
+            .set_file_name("project.trackcut")
+            .save_file()
+        else {
+            return;
+        };
+        let text = match serde_json::to_string_pretty(&project) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status = format!("{}: {err}", tr(self.lang, "Не удалось сохранить проект"));
+                return;
+            }
+        };
+        self.status = match std::fs::write(&path, text) {
+            Ok(()) => format!("{}: {}", tr(self.lang, "Проект сохранён"), path.display()),
+            Err(err) => format!("{}: {err}", tr(self.lang, "Не удалось сохранить проект")),
+        };
+    }
+
+    /// Загружает проект: файлы добавляются заново, отметки применяются после чтения метаданных.
+    fn open_project(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(tr(self.lang, "Проект TrackCut"), &["trackcut", "json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status = format!("{}: {err}", tr(self.lang, "Не удалось открыть проект"));
+                return;
+            }
+        };
+        let project: Project = match serde_json::from_str(&text) {
+            Ok(project) => project,
+            Err(err) => {
+                self.status = format!("{}: {err}", tr(self.lang, "Не удалось открыть проект"));
+                return;
+            }
+        };
+        if project.files.is_empty() {
+            self.status = tr(self.lang, "В проекте нет файлов").to_string();
+            return;
+        }
+
+        self.files.clear();
+        self.selected = 0;
+        self.extra_pick = None;
+        self.pending_restore.clear();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for file in project.files {
+            let path = PathBuf::from(&file.path);
+            if !path.is_file() {
+                continue;
+            }
+            if paths.iter().any(|other| paths_equal(other, &path)) {
+                continue;
+            }
+            paths.push(path.clone());
+            self.pending_restore.push((path, file));
+        }
+        let count = paths.len();
+        self.add_paths(paths);
+        self.status = format!("{} {count}", tr(self.lang, "Проект открыт — файлов:"));
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.settings(self.cfg.window).save();
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -2162,7 +2592,7 @@ impl App {
                     RichText::new("TrackCut")
                         .size(24.0)
                         .strong()
-                        .color(Color32::WHITE),
+                        .color(ui.visuals().strong_text_color()),
                 );
                 ui.label(
                     RichText::new(tr(lang, "удаление дорожек без перекодирования"))
@@ -2258,6 +2688,10 @@ impl App {
             .default_width(300.0)
             .width_range(250.0..=420.0)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("left_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -2277,7 +2711,6 @@ impl App {
                                     && current != lang
                                 {
                                     self.lang = lang;
-                                    save_lang(lang);
                                 }
                             }
                         });
@@ -2531,6 +2964,89 @@ impl App {
                 {
                     self.apply_to_all();
                 }
+
+                ui.add_space(8.0);
+                ui.separator();
+                egui::CollapsingHeader::new(
+                    RichText::new(tr(self.lang, "Настройки")).strong().small(),
+                )
+                .id_salt("settings")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(self.lang, "Тема"));
+                        let current = match self.cfg.theme.as_str() {
+                            "light" => tr(self.lang, "Светлая"),
+                            "system" => tr(self.lang, "Системная"),
+                            _ => tr(self.lang, "Тёмная"),
+                        };
+                        egui::ComboBox::from_id_salt("theme")
+                            .selected_text(current)
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                for (code, label) in [
+                                    ("dark", tr(self.lang, "Тёмная")),
+                                    ("light", tr(self.lang, "Светлая")),
+                                    ("system", tr(self.lang, "Системная")),
+                                ] {
+                                    if ui
+                                        .selectable_label(self.cfg.theme == code, label)
+                                        .clicked()
+                                    {
+                                        self.cfg.theme = code.to_string();
+                                        self.apply_theme(ctx);
+                                    }
+                                }
+                            });
+                    });
+                    ui.checkbox(
+                        &mut self.cfg.notify,
+                        tr(self.lang, "Уведомлять о завершении сборки"),
+                    );
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(self.lang, "Сохранить проект…")).clicked() {
+                            self.save_project();
+                        }
+                        if ui.button(tr(self.lang, "Открыть проект…")).clicked() {
+                            self.open_project();
+                        }
+                    });
+                    let installed = *self.shell_menu.get_or_insert_with(shell_menu_installed);
+                    let label = if installed {
+                        tr(self.lang, "Убрать из меню Проводника")
+                    } else {
+                        tr(self.lang, "Добавить в меню Проводника")
+                    };
+                    if ui.button(label).clicked() {
+                        let install = !installed;
+                        self.status = match shell_menu_apply(
+                            install,
+                            tr(self.lang, "Открыть в TrackCut"),
+                        ) {
+                            Ok(()) => {
+                                self.shell_menu = Some(install);
+                                tr(self.lang, "Меню Проводника обновлено").to_string()
+                            }
+                            Err(err) => format!(
+                                "{}: {err}",
+                                tr(self.lang, "Не удалось обновить меню Проводника")
+                            ),
+                        };
+                    }
+                    let hint = match config::config_file() {
+                        Some(path) if config::portable() => format!(
+                            "{}: {}",
+                            tr(self.lang, "Портативный режим"),
+                            path.display()
+                        ),
+                        Some(path) => {
+                            format!("{}: {}", tr(self.lang, "Настройки"), path.display())
+                        }
+                        None => tr(self.lang, "Настройки").to_string(),
+                    };
+                    ui.label(RichText::new(hint).small().color(MUTED));
+                });
+                });
             });
     }
 
@@ -3101,7 +3617,7 @@ impl App {
                                         ui.label(stream_language(self.lang, stream));
 
                                         let (name_text, color) = if stream.has_name() {
-                                            (stream.display_name().to_string(), Color32::WHITE)
+                                            (stream.display_name().to_string(), ui.visuals().strong_text_color())
                                         } else {
                                             (tr(self.lang, "Без названия").to_string(), MUTED)
                                         };
@@ -3399,7 +3915,27 @@ impl App {
                             ORANGE,
                         )
                     };
-                    ui.label(RichText::new(text).color(color).small());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(text).color(color).small());
+                        if let Some(last) = self.last_outputs.last() {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!(
+                                            "📂 {}",
+                                            tr(self.lang, "Открыть папку с результатом")
+                                        ))
+                                        .small(),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(last.display().to_string())
+                                .clicked()
+                            {
+                                reveal_in_explorer(last);
+                            }
+                        }
+                    });
                 }
             }
 
@@ -3998,15 +4534,34 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn setup_style(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(22, 25, 32);
-    visuals.window_fill = Color32::from_rgb(28, 32, 41);
-    visuals.extreme_bg_color = Color32::from_rgb(16, 18, 24);
-    visuals.faint_bg_color = Color32::from_rgb(32, 37, 47);
-    visuals.selection.bg_fill = Color32::from_rgb(45, 78, 130);
-    visuals.selection.stroke.color = Color32::WHITE;
-    visuals.hyperlink_color = ACCENT;
+fn setup_style(ctx: &egui::Context, theme: &str) {
+    let light = match theme {
+        "light" => true,
+        "system" => system_uses_light(),
+        _ => false,
+    };
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    if light {
+        visuals.panel_fill = Color32::from_rgb(245, 246, 248);
+        visuals.window_fill = Color32::from_rgb(255, 255, 255);
+        visuals.extreme_bg_color = Color32::from_rgb(255, 255, 255);
+        visuals.faint_bg_color = Color32::from_rgb(236, 238, 242);
+        visuals.selection.bg_fill = Color32::from_rgb(45, 78, 130);
+        visuals.selection.stroke.color = Color32::WHITE;
+        visuals.hyperlink_color = Color32::from_rgb(30, 90, 170);
+    } else {
+        visuals.panel_fill = Color32::from_rgb(22, 25, 32);
+        visuals.window_fill = Color32::from_rgb(28, 32, 41);
+        visuals.extreme_bg_color = Color32::from_rgb(16, 18, 24);
+        visuals.faint_bg_color = Color32::from_rgb(32, 37, 47);
+        visuals.selection.bg_fill = Color32::from_rgb(45, 78, 130);
+        visuals.selection.stroke.color = Color32::WHITE;
+        visuals.hyperlink_color = ACCENT;
+    }
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
@@ -4016,4 +4571,186 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
     style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
     ctx.set_style(style);
+}
+
+/// Светлая ли тема оформления Windows (для варианта «Системная»).
+fn system_uses_light() -> bool {
+    #[cfg(windows)]
+    {
+        let output = Command::new("reg")
+            .args([
+                "query",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                "/v",
+                "AppsUseLightTheme",
+            ])
+            .creation_flags(0x0800_0000)
+            .output();
+        if let Ok(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            return text.contains("0x1");
+        }
+    }
+    false
+}
+
+/// Системный звук уведомления.
+fn beep() {
+    #[cfg(windows)]
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBeep(kind: u32) -> i32;
+    }
+    #[cfg(windows)]
+    unsafe {
+        let _ = MessageBeep(0x0000_0040);
+    }
+}
+
+/// Код контейнера для `ui.ini`.
+fn container_code(choice: ContainerChoice) -> &'static str {
+    match choice {
+        ContainerChoice::Auto => "auto",
+        ContainerChoice::Mkv => "mkv",
+        ContainerChoice::Webm => "webm",
+        ContainerChoice::Mp4 => "mp4",
+        ContainerChoice::Mov => "mov",
+    }
+}
+
+/// Контейнер из `ui.ini`.
+fn container_from_code(code: &str) -> ContainerChoice {
+    match code {
+        "mkv" => ContainerChoice::Mkv,
+        "webm" => ContainerChoice::Webm,
+        "mp4" => ContainerChoice::Mp4,
+        "mov" => ContainerChoice::Mov,
+        _ => ContainerChoice::Auto,
+    }
+}
+
+/// Код режима нарезки для `ui.ini`.
+fn split_code(choice: SplitChoice) -> &'static str {
+    match choice {
+        SplitChoice::None => "none",
+        SplitChoice::Every => "every",
+        SplitChoice::Ranges => "ranges",
+    }
+}
+
+/// Режим нарезки из `ui.ini`.
+fn split_from_code(code: &str) -> SplitChoice {
+    match code {
+        "every" => SplitChoice::Every,
+        "ranges" => SplitChoice::Ranges,
+        _ => SplitChoice::None,
+    }
+}
+
+/// Размер в понятном виде: 1,4 ГБ.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Открывает Проводник с выделенным файлом (или на папке).
+fn reveal_in_explorer(path: &Path) {
+    #[cfg(windows)]
+    {
+        let target = if path.is_file() {
+            format!("/select,\"{}\"", path.display())
+        } else {
+            path.display().to_string()
+        };
+        let _ = Command::new("explorer")
+            .arg(target)
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
+/// Расширения, для которых добавляется пункт «Открыть в TrackCut».
+const SHELL_EXTS: [&str; 6] = ["mkv", "mp4", "mov", "webm", "avi", "ts"];
+
+#[cfg(windows)]
+fn run_reg(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("reg")
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if text.is_empty() {
+            "reg завершился с ошибкой".to_string()
+        } else {
+            text
+        })
+    }
+}
+
+#[cfg(windows)]
+fn shell_menu_key(ext: &str) -> String {
+    format!("HKCU\\Software\\Classes\\SystemFileAssociations\\.{ext}\\shell\\TrackCut")
+}
+
+/// Установлен ли пункт «Открыть в TrackCut» в меню Проводника.
+fn shell_menu_installed() -> bool {
+    #[cfg(windows)]
+    {
+        let key = shell_menu_key(SHELL_EXTS[0]);
+        Command::new("reg")
+            .args(["query", &key, "/ve"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Добавляет или убирает пункт «Открыть в TrackCut» для видеофайлов.
+fn shell_menu_apply(install: bool, label: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        let exe = exe.display().to_string();
+        let command = format!("\"{exe}\" \"%1\"");
+        for ext in SHELL_EXTS {
+            let key = shell_menu_key(ext);
+            if install {
+                run_reg(&["add", &key, "/ve", "/d", label, "/f"])?;
+                run_reg(&["add", &key, "/v", "Icon", "/d", &exe, "/f"])?;
+                let command_key = format!("{key}\\command");
+                run_reg(&["add", &command_key, "/ve", "/d", &command, "/f"])?;
+            } else {
+                let _ = run_reg(&["delete", &key, "/f"]);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (install, label);
+        Ok(())
+    }
 }

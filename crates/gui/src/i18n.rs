@@ -6,8 +6,6 @@
 //! Каждый язык — отдельный файл в этой папке: одна таблица «русский → перевод».
 //! Чтобы добавить новый язык, достаточно нового файла и трёх мест в `Lang`.
 
-use std::path::PathBuf;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Lang {
     #[default]
@@ -124,40 +122,3 @@ pub fn tr_dyn(lang: Lang, text: &'static str) -> &'static str {
     tr(lang, text)
 }
 
-const FILE_NAME: &str = "ui.ini";
-
-fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
-    Some(base.join("TrackCut").join(FILE_NAME))
-}
-
-/// Читает сохранённый язык; при любой проблеме — русский.
-pub fn load_lang() -> Lang {
-    let Some(path) = config_path() else {
-        return Lang::Ru;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Lang::Ru;
-    };
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("lang=") {
-            if let Some(lang) = Lang::from_code(value) {
-                return lang;
-            }
-        }
-    }
-    Lang::Ru
-}
-
-/// Сохраняет выбор языка. Ошибки записи не критичны — просто останется русский.
-pub fn save_lang(lang: Lang) {
-    let Some(path) = config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, format!("lang={}\n", lang.code()));
-}
