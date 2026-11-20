@@ -176,7 +176,7 @@ pub fn start_video_segment(
             .arg("-t")
             .arg(format!("{seconds:.2}"))
             .arg("-vf")
-            .arg(format!("scale={width}:{height},fps=12"))
+            .arg(format!("scale={width}:{height},fps=24"))
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

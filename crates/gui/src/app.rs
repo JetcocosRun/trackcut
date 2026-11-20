@@ -587,11 +587,19 @@ impl App {
                                 [frame.width as usize, frame.height as usize],
                                 &frame.rgba,
                             );
-                            window.texture = Some(ctx.load_texture(
-                                "sync_video",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ));
+                            let size = [frame.width as usize, frame.height as usize];
+                            match &mut window.texture {
+                                Some(texture) if texture.size() == size => {
+                                    texture.set(image, egui::TextureOptions::LINEAR);
+                                }
+                                _ => {
+                                    window.texture = Some(ctx.load_texture(
+                                        "sync_video",
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    ));
+                                }
+                            }
                             window.image_size = [frame.width as f32, frame.height as f32];
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -690,7 +698,12 @@ impl App {
                 .map(|window| window.playing || window.video_playing || window.frame_pending)
                 .unwrap_or(false)
         {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            let video_running = self
+                .sync_window
+                .as_ref()
+                .map(|window| window.video_playing)
+                .unwrap_or(false);
+            ctx.request_repaint_after(Duration::from_millis(if video_running { 15 } else { 100 }));
         }
     }
 
