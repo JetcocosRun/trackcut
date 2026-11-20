@@ -1665,6 +1665,10 @@ impl App {
             let mut append_pick = false;
             let mut append_remove: Option<usize> = None;
 
+            egui::ScrollArea::vertical()
+                .id_salt("center_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             let file_size;
             {
                 let entry = &mut self.files[self.selected];
@@ -1770,12 +1774,10 @@ impl App {
                 });
 
                 ui.add_space(4.0);
-                let table_height = (ui.available_height() - 190.0).max(150.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    egui::ScrollArea::both()
+                    egui::ScrollArea::horizontal()
                         .id_salt("tracks")
                         .auto_shrink([false, false])
-                        .max_height(table_height)
                         .show(ui, |ui| {
                             egui::Grid::new("track_grid")
                                 .striped(true)
@@ -2302,6 +2304,7 @@ impl App {
                 }
                 self.status = "Файл убран из склейки".into();
             }
+                });
         });
     }
 
