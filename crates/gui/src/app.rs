@@ -14,6 +14,7 @@ use trackcut_core::{
     KeepTrack, MediaInfo, MuxPlan, OffsetEstimate, ToolPaths,
 };
 
+use crate::i18n::{save_lang, tr, Lang};
 use crate::preview::{
     request_frame, start_pair_preview, start_preview, start_track_preview, start_video_segment,
     FrameMsg, PreviewMsg, PreviewState, VideoFrame,
@@ -70,11 +71,11 @@ enum SplitChoice {
 }
 
 impl SplitChoice {
-    fn label(self) -> &'static str {
+    fn label(self, lang: Lang) -> &'static str {
         match self {
-            SplitChoice::None => "Не резать",
-            SplitChoice::Every => "Каждые N минут",
-            SplitChoice::Ranges => "Диапазоны",
+            SplitChoice::None => tr(lang, "Не резать"),
+            SplitChoice::Every => tr(lang, "Каждые N минут"),
+            SplitChoice::Ranges => tr(lang, "Диапазоны"),
         }
     }
 }
@@ -307,6 +308,8 @@ pub struct App {
     split_minutes: f32,
     split_ranges: String,
 
+    lang: Lang,
+
     filter: String,
     tags_open: Option<usize>,
     extra_pick: Option<ExtraPick>,
@@ -339,6 +342,7 @@ impl App {
         let (preview_tx, preview_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::channel();
 
+        let lang = crate::i18n::load_lang();
         let mut app = Self {
             tools,
             tool_versions,
@@ -358,6 +362,7 @@ impl App {
             split: SplitChoice::None,
             split_minutes: 10.0,
             split_ranges: String::new(),
+            lang,
             filter: String::new(),
             tags_open: None,
             extra_pick: None,
@@ -371,7 +376,7 @@ impl App {
             frame_tx,
             frame_rx,
             log: Vec::new(),
-            status: "Добавьте файл, чтобы увидеть дорожки".to_string(),
+            status: tr(lang, "Добавьте файл, чтобы увидеть дорожки").to_string(),
         };
 
         if let Some(arg) = std::env::args().nth(1) {
@@ -402,9 +407,9 @@ impl App {
         self.tool_versions = self.tools.versions();
         let missing = self.tools.missing();
         self.status = if missing.is_empty() {
-            "Все инструменты найдены".to_string()
+            tr(self.lang, "Все инструменты найдены").to_string()
         } else {
-            format!("Не найдены: {}", missing.join(", "))
+            format!("{} {}", tr(self.lang, "Не найдены:"), missing.join(", "))
         };
     }
 
@@ -436,14 +441,18 @@ impl App {
             if let Some(first) = self.files.iter().position(|file| file.probing) {
                 self.selected = first;
             }
-            self.status = format!("Добавлено файлов: {added}. Читаю метаданные…");
+            self.status = format!(
+                "{} {added}. {}",
+                tr(self.lang, "Добавлено файлов:"),
+                tr(self.lang, "Читаю метаданные…")
+            );
         }
     }
 
     fn pick_files(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
             .add_filter(
-                "Видео",
+                tr(self.lang, "Видео"),
                 &[
                     "mkv", "mp4", "m4v", "mov", "webm", "avi", "ts", "m2ts", "mpg", "mpeg",
                 ],
@@ -511,7 +520,7 @@ impl App {
                 }
             }
             if self.probe_pending == 0 {
-                self.status = "Метаданные загружены".to_string();
+                self.status = tr(self.lang, "Метаданные загружены").to_string();
             }
         }
 
@@ -538,7 +547,7 @@ impl App {
                             if SYNC_TOKEN_BASE + win.uid as u64 == token {
                                 win.playing = false;
                                 win.stop = None;
-                                win.status = format!("звук: {err}");
+                                win.status = format!("{}: {err}", tr(self.lang, "звук"));
                             }
                         }
                     } else {
@@ -546,8 +555,10 @@ impl App {
                             self.preview.token = None;
                             self.preview.stop = None;
                         }
-                        self.log.push(format!("Прослушивание: {err}"));
-                        self.status = "Не удалось воспроизвести фрагмент".to_string();
+                        self.log
+                            .push(format!("{}: {err}", tr(self.lang, "Прослушивание")));
+                        self.status =
+                            tr(self.lang, "Не удалось воспроизвести фрагмент").to_string();
                     }
                 }
             }
@@ -574,7 +585,7 @@ impl App {
                         win.image_size = [width as f32, height as f32];
                         win.status.clear();
                     }
-                    Err(err) => win.status = format!("кадр: {err}"),
+                    Err(err) => win.status = format!("{}: {err}", tr(self.lang, "кадр")),
                 }
             }
         }
@@ -684,9 +695,13 @@ impl App {
             self.cancel = None;
             self.job = JobState::Done { ok, failed };
             self.status = if failed == 0 {
-                format!("Готово: {ok} файл(ов) собрано")
+                format!("{}: {ok}", tr(self.lang, "Файлов собрано"))
             } else {
-                format!("Завершено: успешно {ok}, с ошибками {failed}")
+                format!(
+                    "{} {ok}, {} {failed}",
+                    tr(self.lang, "Успешно:"),
+                    tr(self.lang, "с ошибками:")
+                )
             };
             self.log.push(self.status.clone());
             if let Some(rx) = &self.job_rx {
@@ -751,14 +766,19 @@ impl App {
             SplitChoice::Ranges => {
                 let text = self.split_ranges.trim();
                 if text.is_empty() {
-                    return Err(
-                        "нарезка по диапазонам: впишите, например, 00:10:00-00:20:00".into(),
-                    );
+                    return Err(tr(
+                        self.lang,
+                        "нарезка по диапазонам: впишите, например, 00:10:00-00:20:00",
+                    )
+                    .into());
                 }
                 let ranges = parse_ranges(text).filter(|ranges| !ranges.is_empty()).ok_or_else(
                     || {
-                        "нарезка по диапазонам: не понял формат. Пример: 00:10:00-00:20:00, 00:30:00-"
-                            .to_string()
+                        tr(
+                            self.lang,
+                            "нарезка по диапазонам: не понял формат. Пример: 00:10:00-00:20:00, 00:30:00-",
+                        )
+                        .to_string()
                     },
                 )?;
                 Ok(Some(SplitSpec::by_ranges(ranges)))
@@ -845,7 +865,7 @@ impl App {
         }
 
         if jobs.is_empty() {
-            return Err("нет файлов с выбранными дорожками".to_string());
+            return Err(tr(self.lang, "нет файлов с выбранными дорожками").to_string());
         }
         Ok(jobs)
     }
@@ -862,14 +882,14 @@ impl App {
             }
         };
         let total = jobs.len();
-        self.start_jobs(jobs, format!("Сборка: {total} файл(ов)"));
+        self.start_jobs(jobs, format!("{}: {total}", tr(self.lang, "Сборка")));
     }
 
     fn start_extract(&mut self, job: Job) {
         if self.is_busy() {
             return;
         }
-        let status = format!("Извлечение: {}", job.label);
+        let status = format!("{}: {}", tr(self.lang, "Извлечение"), job.label);
         self.start_jobs(vec![job], status);
     }
 
@@ -890,6 +910,7 @@ impl App {
         self.status = status;
 
         let tools = self.tools.clone();
+        let lang = self.lang;
         std::thread::spawn(move || {
             let mut ok = 0usize;
             let mut failed = 0usize;
@@ -935,7 +956,7 @@ impl App {
                             .map(|name| name.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let message = if is_extract {
-                            format!("{}: сохранено в {name}", job.label)
+                            format!("{}: {} {name}", job.label, tr(lang, "сохранено в"))
                         } else {
                             format!("{} → {name}", job.label)
                         };
@@ -967,7 +988,7 @@ impl App {
     fn request_cancel(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.status = "Отмена…".to_string();
+            self.status = tr(self.lang, "Отмена…").to_string();
         }
     }
 
@@ -1036,7 +1057,7 @@ impl App {
             (delay, stream.kind)
         };
         if kind != StreamKind::Audio && kind != StreamKind::Subtitle {
-            self.status = "Сдвиг задаётся для аудио и субтитров".to_string();
+            self.status = tr(self.lang, "Сдвиг задаётся для аудио и субтитров").to_string();
             return;
         }
         let time_ms = trackcut_core::preview::preview_start_ms(info.duration_ms);
@@ -1099,11 +1120,12 @@ impl App {
             .iter()
             .find(|stream| stream.kind == StreamKind::Video && stream.ff_index.is_some());
         let Some(ff_index) = video.and_then(|stream| stream.ff_index) else {
-            window.status = "В файле нет видеодорожки — видно только звук".to_string();
+            window.status =
+                tr(self.lang, "В файле нет видеодорожки — видно только звук").to_string();
             return;
         };
         if self.tools.ffmpeg.is_none() {
-            window.status = "Для кадра нужен ffmpeg".to_string();
+            window.status = tr(self.lang, "Для кадра нужен ffmpeg").to_string();
             return;
         }
         window.frame_token += 1;
@@ -1142,7 +1164,7 @@ impl App {
             return;
         };
         if self.tools.ffmpeg.is_none() {
-            self.status = "Для прослушивания нужен ffmpeg".to_string();
+            self.status = tr(self.lang, "Для прослушивания нужен ffmpeg").to_string();
             return;
         }
 
@@ -1150,7 +1172,8 @@ impl App {
         let main_path = info.path.clone();
         let stop = if internal {
             let Some(ff_index) = info.streams.get(uid).and_then(|stream| stream.ff_index) else {
-                self.status = "У этой дорожки нет индекса для декодирования".to_string();
+                self.status =
+                    tr(self.lang, "У этой дорожки нет индекса для декодирования").to_string();
                 return;
             };
             start_track_preview(
@@ -1167,7 +1190,7 @@ impl App {
                 return;
             };
             let Some(main_uid) = main_audio_uid(&info, &entry.keep) else {
-                self.status = "В основном файле нет аудиодорожки".to_string();
+                self.status = tr(self.lang, "В основном файле нет аудиодорожки").to_string();
                 return;
             };
             let Some(main_ff) = info
@@ -1175,7 +1198,11 @@ impl App {
                 .get(main_uid)
                 .and_then(|stream| stream.ff_index)
             else {
-                self.status = "У основной дорожки нет индекса для декодирования".to_string();
+                self.status = tr(
+                    self.lang,
+                    "У основной дорожки нет индекса для декодирования",
+                )
+                .to_string();
                 return;
             };
             let Some(extra_ff) = extra
@@ -1184,7 +1211,8 @@ impl App {
                 .get(uid)
                 .and_then(|stream| stream.ff_index)
             else {
-                self.status = "У внешней дорожки нет индекса для декодирования".to_string();
+                self.status =
+                    tr(self.lang, "У внешней дорожки нет индекса для декодирования").to_string();
                 return;
             };
             start_pair_preview(
@@ -1243,7 +1271,7 @@ impl App {
             window.video_stop = video_stop;
             window.video_rx = video_rx;
             window.video_token = video_token;
-            window.status = "Играют обе дорожки и видео…".to_string();
+            window.status = tr(self.lang, "Играют обе дорожки и видео…").to_string();
         }
     }
 
@@ -1271,13 +1299,13 @@ impl App {
             main_info
                 .as_ref()
                 .and_then(|info| info.streams.get(window.uid))
-                .map(|stream| stream.display_name().to_string())
+                .map(|stream| stream_name(self.lang, stream))
         } else {
             self.files
                 .get(self.selected)
                 .and_then(|entry| entry.extras.get(window.source))
                 .and_then(|extra| extra.info.streams.get(window.uid))
-                .map(|stream| stream.display_name().to_string())
+                .map(|stream| stream_name(self.lang, stream))
         }
         .unwrap_or_default();
         let duration_ms = main_info
@@ -1295,7 +1323,7 @@ impl App {
         let mut auto = false;
         let mut request = false;
 
-        egui::Window::new("Синхрон дорожки")
+        egui::Window::new(tr(self.lang, "Синхрон дорожки"))
             .open(&mut open)
             .default_width(790.0)
             .resizable(true)
@@ -1308,11 +1336,17 @@ impl App {
                     }
                 });
                 let hint = if window.internal {
-                    "Дорожка из этого файла со сдвигом относительно остальных. \
-                     Видно кадр и слышно, как звук ложится на видео."
+                    tr(
+                        self.lang,
+                        "Дорожка из этого файла со сдвигом относительно остальных. Видно кадр и \
+                         слышно, как звук ложится на видео.",
+                    )
                 } else {
-                    "Кадр из основного файла, обе дорожки звучат вместе. Двигайте сдвиг, \
-                     пока речь не совпадёт. Положительный сдвиг — внешняя позже."
+                    tr(
+                        self.lang,
+                        "Кадр из основного файла, обе дорожки звучат вместе. Двигайте сдвиг, пока \
+                         речь не совпадёт. Положительный сдвиг — внешняя позже.",
+                    )
                 };
                 ui.label(RichText::new(hint).small().color(MUTED));
 
@@ -1333,7 +1367,11 @@ impl App {
                         });
                     } else {
                         ui.allocate_space(egui::vec2(ui.available_width(), 60.0));
-                        ui.label(RichText::new("Кадр не загружен").small().color(MUTED));
+                        ui.label(
+                            RichText::new(tr(self.lang, "Кадр не загружен"))
+                                .small()
+                                .color(MUTED),
+                        );
                     }
                 });
                 if !window.status.is_empty() {
@@ -1342,11 +1380,11 @@ impl App {
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("−10 с").clicked() {
+                    if ui.button(tr(self.lang, "−10 с")).clicked() {
                         window.time_ms = window.time_ms.saturating_sub(10_000);
                         request = true;
                     }
-                    if ui.button("−1 с").clicked() {
+                    if ui.button(tr(self.lang, "−1 с")).clicked() {
                         window.time_ms = window.time_ms.saturating_sub(1_000);
                         request = true;
                     }
@@ -1371,24 +1409,24 @@ impl App {
                     );
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("+1 с").clicked() {
+                    if ui.button(tr(self.lang, "+1 с")).clicked() {
                         window.time_ms = (window.time_ms + 1_000).min(duration_ms.max(1_000));
                         request = true;
                     }
-                    if ui.button("+10 с").clicked() {
+                    if ui.button(tr(self.lang, "+10 с")).clicked() {
                         window.time_ms = (window.time_ms + 10_000).min(duration_ms.max(1_000));
                         request = true;
                     }
-                    if ui.button("Начало").clicked() {
+                    if ui.button(tr(self.lang, "Начало")).clicked() {
                         window.time_ms = 0;
                         request = true;
                     }
-                    if ui.button("Середина").clicked() {
+                    if ui.button(tr(self.lang, "Середина")).clicked() {
                         window.time_ms = duration_ms / 2;
                         request = true;
                     }
                     ui.label(
-                        RichText::new("Кадр берётся по ближайшему ключевому кадру")
+                        RichText::new(tr(self.lang, "Кадр берётся по ближайшему ключевому кадру"))
                             .small()
                             .color(MUTED),
                     );
@@ -1397,10 +1435,10 @@ impl App {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Сдвиг").strong());
+                    ui.label(RichText::new(tr(self.lang, "Сдвиг")).strong());
                     let response = ui.add(
                         egui::Slider::new(&mut window.delay_ms, -10_000..=10_000)
-                            .suffix(" мс")
+                            .suffix(format!(" {}", tr(self.lang, "мс")))
                             .step_by(1.0),
                     );
                     if response.changed() {
@@ -1422,18 +1460,24 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     let label = if window.playing || window.video_playing {
-                        "■ Стоп"
+                        tr(self.lang, "■ Стоп")
                     } else {
-                        "▶ Смотреть и слушать (12 с)"
+                        tr(self.lang, "▶ Смотреть и слушать (12 с)")
                     };
                     if ui
                         .add_enabled(has_ffmpeg, egui::Button::new(label))
                         .on_hover_text(if window.internal {
-                            "Видео и эта дорожка со сдвигом играют вместе 12 секунд — \
-                             видно и слышно, как звук ложится на картинку"
+                            tr(
+                                self.lang,
+                                "Видео и эта дорожка со сдвигом играют вместе 12 секунд — \
+                                 видно и слышно, как звук ложится на картинку",
+                            )
                         } else {
-                            "Видео и обе дорожки играют вместе 12 секунд — видно и слышно, \
-                             как ложится сдвиг"
+                            tr(
+                                self.lang,
+                                "Видео и обе дорожки играют вместе 12 секунд — видно и слышно, \
+                                 как ложится сдвиг",
+                            )
                         })
                         .clicked()
                     {
@@ -1445,18 +1489,23 @@ impl App {
                     }
                     if window.syncing {
                         ui.add(egui::Spinner::new().size(12.0));
-                        ui.label(RichText::new("сравниваю…").small().color(MUTED));
+                        ui.label(
+                            RichText::new(tr(self.lang, "сравниваю…"))
+                                .small()
+                                .color(MUTED),
+                        );
                     } else if ui
-                        .add_enabled(!busy, egui::Button::new("⏱ Авто"))
-                        .on_hover_text(
+                        .add_enabled(!busy, egui::Button::new(tr(self.lang, "⏱ Авто")))
+                        .on_hover_text(tr(
+                            self.lang,
                             "Подобрать сдвиг по звуку: сравнить огибающие громкости дорожек",
-                        )
+                        ))
                         .clicked()
                     {
                         auto = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Готово").clicked() {
+                        if ui.button(tr(self.lang, "Готово")).clicked() {
                             close = true;
                         }
                     });
@@ -1469,7 +1518,7 @@ impl App {
         if close || !open {
             self.stop_sync_playback();
             self.sync_window = None;
-            self.status = "Окно синхрона закрыто".to_string();
+            self.status = tr(self.lang, "Окно синхрона закрыто").to_string();
             return;
         }
 
@@ -1542,15 +1591,19 @@ impl App {
         let extra_info = extra.info.clone();
 
         let Some(main_uid) = main_audio_uid(&info, &entry.keep) else {
-            self.status = "В основном файле нет аудиодорожки — не с чем сравнивать".to_string();
+            self.status = tr(
+                self.lang,
+                "В основном файле нет аудиодорожки — не с чем сравнивать",
+            )
+            .to_string();
             return;
         };
         if extra_info.streams.get(uid).map(|stream| stream.kind) != Some(StreamKind::Audio) {
-            self.status = "Сдвиг подбирается только для аудио".to_string();
+            self.status = tr(self.lang, "Сдвиг подбирается только для аудио").to_string();
             return;
         }
         if self.tools.ffmpeg.is_none() {
-            self.status = "Для подбора сдвига нужен ffmpeg".to_string();
+            self.status = tr(self.lang, "Для подбора сдвига нужен ffmpeg").to_string();
             return;
         }
 
@@ -1563,7 +1616,7 @@ impl App {
 
         let tools = self.tools.clone();
         let tx = self.probe_tx.clone();
-        self.status = "Сравниваю звук дорожек…".to_string();
+        self.status = tr(self.lang, "Сравниваю звук дорожек…").to_string();
         std::thread::spawn(move || {
             let result = estimate_delay(&tools, &info, main_uid, &extra_info, uid)
                 .map_err(|err| err.to_string());
@@ -1588,11 +1641,11 @@ impl App {
             return;
         };
         if info.streams.get(uid).map(|stream| stream.kind) != Some(StreamKind::Audio) {
-            self.status = "Сдвиг подбирается только для аудио".to_string();
+            self.status = tr(self.lang, "Сдвиг подбирается только для аудио").to_string();
             return;
         }
         if self.tools.ffmpeg.is_none() {
-            self.status = "Для подбора сдвига нужен ffmpeg".to_string();
+            self.status = tr(self.lang, "Для подбора сдвига нужен ffmpeg").to_string();
             return;
         }
 
@@ -1606,7 +1659,11 @@ impl App {
                     .map(|(index, _)| index)
             });
         let Some(reference) = reference else {
-            self.status = "В файле только одна аудиодорожка — сравнивать не с чем".to_string();
+            self.status = tr(
+                self.lang,
+                "В файле только одна аудиодорожка — сравнивать не с чем",
+            )
+            .to_string();
             return;
         };
 
@@ -1616,7 +1673,7 @@ impl App {
         }
         let tools = self.tools.clone();
         let tx = self.probe_tx.clone();
-        self.status = "Сравниваю звук дорожек…".to_string();
+        self.status = tr(self.lang, "Сравниваю звук дорожек…").to_string();
         std::thread::spawn(move || {
             let result =
                 estimate_delay(&tools, &info, reference, &info, uid).map_err(|err| err.to_string());
@@ -1646,24 +1703,39 @@ impl App {
                 Ok(estimate) => {
                     delay_value = estimate.delay_ms;
                     self.status = match estimate.warnings.first() {
-                        Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
-                        None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
+                        Some(warning) => format!(
+                            "{} {} {}. {} {warning}",
+                            tr(self.lang, "Сдвиг"),
+                            estimate.delay_ms,
+                            tr(self.lang, "мс"),
+                            tr(self.lang, "но")
+                        ),
+                        None => format!(
+                            "{}: {} {}",
+                            tr(self.lang, "Сдвиг подобран:"),
+                            estimate.delay_ms,
+                            tr(self.lang, "мс")
+                        ),
                     };
                     for warning in &estimate.warnings {
-                        self.log.push(format!("Сдвиг: {warning}"));
+                        self.log
+                            .push(format!("{}: {warning}", tr(self.lang, "Сдвиг")));
                     }
                     Some(format!(
-                        "{}{} мс · окна {}/{} · совпадение {:.0}%",
+                        "{}{} {} · {} {}/{} · {} {:.0}%",
                         if estimate.delay_ms > 0 { "+" } else { "" },
                         estimate.delay_ms,
+                        tr(self.lang, "мс"),
+                        tr(self.lang, "окна"),
                         estimate.windows_agree,
                         estimate.windows_total,
+                        tr(self.lang, "совпадение"),
                         estimate.score.max(0.0) * 100.0
                     ))
                 }
                 Err(err) => {
-                    self.status = "Не удалось подобрать сдвиг".to_string();
-                    Some(format!("не удалось: {err}"))
+                    self.status = tr(self.lang, "Не удалось подобрать сдвиг").to_string();
+                    Some(format!("{}: {err}", tr(self.lang, "не удалось")))
                 }
             };
             if estimated_ok {
@@ -1690,23 +1762,38 @@ impl App {
                     delay_value = estimate.delay_ms;
                     let sign = if estimate.delay_ms > 0 { "+" } else { "" };
                     track.sync_note = Some(format!(
-                        "{sign}{} мс · окна {}/{} · совпадение {:.0}%",
+                        "{sign}{} {} · {} {}/{} · {} {:.0}%",
                         estimate.delay_ms,
+                        tr(self.lang, "мс"),
+                        tr(self.lang, "окна"),
                         estimate.windows_agree,
                         estimate.windows_total,
+                        tr(self.lang, "совпадение"),
                         estimate.score.max(0.0) * 100.0
                     ));
                     self.status = match estimate.warnings.first() {
-                        Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
-                        None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
+                        Some(warning) => format!(
+                            "{} {} {}. {} {warning}",
+                            tr(self.lang, "Сдвиг"),
+                            estimate.delay_ms,
+                            tr(self.lang, "мс"),
+                            tr(self.lang, "но")
+                        ),
+                        None => format!(
+                            "{}: {} {}",
+                            tr(self.lang, "Сдвиг подобран:"),
+                            estimate.delay_ms,
+                            tr(self.lang, "мс")
+                        ),
                     };
                     for warning in &estimate.warnings {
-                        self.log.push(format!("Сдвиг: {warning}"));
+                        self.log
+                            .push(format!("{}: {warning}", tr(self.lang, "Сдвиг")));
                     }
                 }
                 Err(err) => {
-                    track.sync_note = Some(format!("не удалось: {err}"));
-                    self.status = "Не удалось подобрать сдвиг".to_string();
+                    track.sync_note = Some(format!("{}: {err}", tr(self.lang, "не удалось")));
+                    self.status = tr(self.lang, "Не удалось подобрать сдвиг").to_string();
                 }
             }
             note_text = track.sync_note.clone();
@@ -1731,11 +1818,11 @@ impl App {
             return;
         };
         let Some(ff_index) = stream.ff_index else {
-            self.status = "У этой дорожки нет индекса для декодирования".to_string();
+            self.status = tr(self.lang, "У этой дорожки нет индекса для декодирования").to_string();
             return;
         };
         if self.tools.ffmpeg.is_none() {
-            self.status = "Для прослушивания нужен ffmpeg".to_string();
+            self.status = tr(self.lang, "Для прослушивания нужен ffmpeg").to_string();
             return;
         }
 
@@ -1748,7 +1835,7 @@ impl App {
         );
         self.preview.token = Some(token);
         self.preview.stop = Some(stop);
-        self.preview.status = "Играет фрагмент…".to_string();
+        self.preview.status = tr(self.lang, "Играет фрагмент…").to_string();
     }
 
     /// Сохраняет одну дорожку текущего файла в mka/mks/mkv.
@@ -1775,9 +1862,9 @@ impl App {
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| "track.mka".to_string()),
             )
-            .add_filter("Дорожка", &["mka", "mks", "mkv"])
-            .add_filter("Аудио (MKA)", &["mka"])
-            .add_filter("Субтитры (MKS)", &["mks"])
+            .add_filter(tr(self.lang, "Дорожка"), &["mka", "mks", "mkv"])
+            .add_filter(tr(self.lang, "Аудио (MKA)"), &["mka"])
+            .add_filter(tr(self.lang, "Субтитры (MKS)"), &["mks"])
             .save_file()
         else {
             return;
@@ -1803,7 +1890,7 @@ impl App {
         };
         self.start_extract(Job {
             file_index: self.selected,
-            label: format!("{label} · дорожка {}", uid + 1),
+            label: format!("{label} · {} {}", tr(self.lang, "дорожка"), uid + 1),
             op: JobOp::Extract { info, plan },
         });
     }
@@ -1815,7 +1902,7 @@ impl App {
         }
         let Some(path) = rfd::FileDialog::new()
             .add_filter(
-                "Видео и дорожки",
+                tr(self.lang, "Видео и дорожки"),
                 &[
                     "mkv", "mka", "mks", "mp4", "m4v", "mov", "webm", "avi", "ts", "m2ts", "mpg",
                     "mpeg", "ac3", "eac3", "dts", "flac", "aac", "m4a", "ogg", "opus", "srt",
@@ -1847,7 +1934,10 @@ impl App {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Главы или MKV", &["mkv", "xml", "txt", "ogm", "cue"])
+            .add_filter(
+                tr(self.lang, "Главы или MKV"),
+                &["mkv", "xml", "txt", "ogm", "cue"],
+            )
             .pick_file()
         else {
             return;
@@ -1859,7 +1949,7 @@ impl App {
         let xml = match trackcut_core::resolve_chapters(&path, &self.tools) {
             Ok(xml) => xml,
             Err(err) => {
-                self.status = format!("Главы: {err}");
+                self.status = format!("{}: {err}", tr(self.lang, "Главы"));
                 return;
             }
         };
@@ -1867,7 +1957,7 @@ impl App {
             entry.chapters_file = Some(xml);
             entry.chapters_label = Some(label);
         }
-        self.status = format!("Главы из: {}", path.display());
+        self.status = format!("{}: {}", tr(self.lang, "Главы из"), path.display());
     }
 
     /// Добавляет файлы в склейку (append) текущего файла.
@@ -1876,7 +1966,10 @@ impl App {
             return;
         }
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Видео", &["mkv", "webm", "mp4", "mov", "m4v"])
+            .add_filter(
+                tr(self.lang, "Видео"),
+                &["mkv", "webm", "mp4", "mov", "m4v"],
+            )
             .pick_files()
         else {
             return;
@@ -1900,7 +1993,7 @@ impl App {
             }
             added
         };
-        self.status = format!("В склейку добавлено файлов: {added}");
+        self.status = format!("{} {added}", tr(self.lang, "В склейку добавлено файлов:"));
     }
 
     fn apply_preset(&mut self, preset: Preset) {
@@ -1979,7 +2072,7 @@ impl App {
                 }
             }
         }
-        self.status = "Правило применено ко всем файлам".to_string();
+        self.status = tr(self.lang, "Правило применено ко всем файлам").to_string();
     }
 
     fn open_tags(&mut self, uid: usize) {
@@ -2061,6 +2154,7 @@ impl App {
     }
 
     fn show_top(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -2071,7 +2165,7 @@ impl App {
                         .color(Color32::WHITE),
                 );
                 ui.label(
-                    RichText::new("удаление дорожек без перекодирования")
+                    RichText::new(tr(lang, "удаление дорожек без перекодирования"))
                         .size(13.0)
                         .color(MUTED),
                 );
@@ -2079,19 +2173,22 @@ impl App {
                     if ui
                         .add_enabled(
                             !self.is_busy(),
-                            egui::Button::new(RichText::new("＋ Добавить файлы").strong()),
+                            egui::Button::new(
+                                RichText::new(format!("＋ {}", tr(lang, "Добавить файлы")))
+                                    .strong(),
+                            ),
                         )
                         .clicked()
                     {
                         self.pick_files();
                     }
                     if ui
-                        .add_enabled(!self.is_busy(), egui::Button::new("Очистить"))
+                        .add_enabled(!self.is_busy(), egui::Button::new(tr(lang, "Очистить")))
                         .clicked()
                     {
                         self.files.clear();
                         self.selected = 0;
-                        self.status = "Список очищен".to_string();
+                        self.status = tr(lang, "Список очищен").to_string();
                     }
                 });
             });
@@ -2127,11 +2224,15 @@ impl App {
                         ORANGE
                     };
                     ui.label(
-                        RichText::new(format!("не найдены: {}", missing.join(", ")))
-                            .color(color)
-                            .small(),
+                        RichText::new(format!(
+                            "{}: {}",
+                            tr(lang, "не найдены"),
+                            missing.join(", ")
+                        ))
+                        .color(color)
+                        .small(),
                     );
-                    if ui.small_button("Повторить поиск").clicked() {
+                    if ui.small_button(tr(lang, "Повторить поиск")).clicked() {
                         self.refresh_tools();
                     }
                 }
@@ -2139,10 +2240,11 @@ impl App {
 
             if self.tools.ffmpeg.is_none() || self.tools.ffprobe.is_none() {
                 ui.label(
-                    RichText::new(
+                    RichText::new(tr(
+                        self.lang,
                         "Положите ffmpeg/ffprobe/mkvmerge в папку tools рядом с программой \
-                             или задайте TRACKCUT_FFMPEG, TRACKCUT_FFPROBE, TRACKCUT_MKVEMBLE.",
-                    )
+                         или задайте TRACKCUT_FFMPEG, TRACKCUT_FFPROBE, TRACKCUT_MKVMERGE.",
+                    ))
                     .color(ORANGE)
                     .small(),
                 );
@@ -2158,7 +2260,31 @@ impl App {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Файлы").strong());
+                    ui.label(
+                        RichText::new(tr(self.lang, "Язык"))
+                            .small()
+                            .color(MUTED),
+                    );
+                    let current = self.lang;
+                    egui::ComboBox::from_id_salt("lang")
+                        .selected_text(current.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for lang in Lang::all() {
+                                if ui
+                                    .selectable_label(current == lang, lang.label())
+                                    .clicked()
+                                    && current != lang
+                                {
+                                    self.lang = lang;
+                                    save_lang(lang);
+                                }
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr(self.lang, "Файлы")).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{}", self.files.len()))
@@ -2209,7 +2335,7 @@ impl App {
                                             egui::RichText::new("✕").color(RED).small(),
                                         ),
                                     )
-                                    .on_hover_text("Убрать файл из списка")
+                                    .on_hover_text(tr(self.lang, "Убрать файл из списка"))
                                     .clicked()
                                 {
                                     remove = Some(index);
@@ -2219,9 +2345,10 @@ impl App {
                         if self.files.is_empty() {
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new(
-                                    "Перетащите видео сюда\nили нажмите «Добавить файлы»",
-                                )
+                                RichText::new(tr(
+                                    self.lang,
+                                    "Перетащите видео сюда или нажмите «Добавить файлы»",
+                                ))
                                 .color(MUTED)
                                 .small(),
                             );
@@ -2247,14 +2374,14 @@ impl App {
                 }
 
                 ui.separator();
-                ui.label(RichText::new("Выходной файл").strong());
+                ui.label(RichText::new(tr(self.lang, "Выходной файл")).strong());
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Контейнер");
+                    ui.label(tr(self.lang, "Контейнер"));
                     egui::ComboBox::from_id_salt("container")
                         .selected_text(match self.output_container {
-                            ContainerChoice::Auto => "как у входа",
+                            ContainerChoice::Auto => tr(self.lang, "как у входа"),
                             ContainerChoice::Mkv => "MKV",
                             ContainerChoice::Webm => "WebM",
                             ContainerChoice::Mp4 => "MP4",
@@ -2264,7 +2391,7 @@ impl App {
                             ui.selectable_value(
                                 &mut self.output_container,
                                 ContainerChoice::Auto,
-                                "как у входа",
+                                tr(self.lang, "как у входа"),
                             );
                             ui.selectable_value(
                                 &mut self.output_container,
@@ -2294,15 +2421,15 @@ impl App {
                         .output_dir
                         .as_ref()
                         .map(|dir| truncate_chars(&dir.display().to_string(), 22))
-                        .unwrap_or_else(|| "рядом с исходником".to_string());
+                        .unwrap_or_else(|| tr(self.lang, "рядом с исходником").to_string());
                     ui.label(RichText::new(text).small().color(MUTED))
                         .on_hover_text(
                             self.output_dir
                                 .as_ref()
                                 .map(|dir| dir.display().to_string())
-                                .unwrap_or_else(|| "рядом с исходником".to_string()),
+                                .unwrap_or_else(|| tr(self.lang, "рядом с исходником").to_string()),
                         );
-                    if ui.small_button("Папка…").clicked() {
+                    if ui.small_button(tr(self.lang, "Папка…")).clicked() {
                         self.pick_output_dir();
                     }
                     if self.output_dir.is_some() && ui.small_button("×").clicked() {
@@ -2311,51 +2438,57 @@ impl App {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("Суффикс");
+                    ui.label(tr(self.lang, "Суффикс"));
                     ui.add(egui::TextEdit::singleline(&mut self.suffix).desired_width(110.0));
                 });
 
                 ui.add_space(2.0);
-                ui.checkbox(&mut self.keep_chapters, "Сохранять главы");
-                ui.checkbox(&mut self.keep_tags, "Сохранять теги");
+                ui.checkbox(
+                    &mut self.keep_chapters,
+                    tr(self.lang, "Сохранять главы"),
+                );
+                ui.checkbox(&mut self.keep_tags, tr(self.lang, "Сохранять теги"));
                 ui.checkbox(
                     &mut self.keep_attachments,
-                    "Сохранять вложения (шрифты ASS)",
+                    tr(self.lang, "Сохранять вложения (шрифты ASS)"),
                 );
                 ui.checkbox(
                     &mut self.mov_text,
-                    "Конвертировать субтитры в MOV text (MP4)",
+                    tr(self.lang, "Конвертировать субтитры в MOV text (MP4)"),
                 )
-                .on_hover_text(
+                .on_hover_text(tr(
+                    self.lang,
                     "Единственное исключение из правила «без перекодирования»: SRT/ASS → MOV text",
-                );
-                ui.checkbox(&mut self.overwrite, "Перезаписывать готовый файл")
-                    .on_hover_text(
-                        "Исходник не изменяется никогда: результат всегда пишется в отдельный \
-                         файл. Галочка лишь разрешает заменить уже существующий результат с тем \
-                         же именем — иначе рядом появится файл с припиской (2).",
-                    );
+                ));
+                ui.checkbox(
+                    &mut self.overwrite,
+                    tr(self.lang, "Перезаписывать готовый файл"),
+                )
+                    .on_hover_text(tr(
+                        self.lang,
+                        "Исходник не изменяется никогда: результат всегда пишется в отдельный файл. Галочка лишь разрешает заменить уже существующий результат с тем же именем — иначе рядом появится файл с припиской (2).",
+                    ));
 
                 ui.add_space(6.0);
-                ui.label(RichText::new("Нарезка").strong().small());
+                ui.label(RichText::new(tr(self.lang, "Нарезка")).strong().small());
                 egui::ComboBox::from_id_salt("split_kind")
-                    .selected_text(self.split.label())
+                    .selected_text(self.split.label(self.lang))
                     .width(190.0)
                     .show_ui(ui, |ui| {
                         for choice in [SplitChoice::None, SplitChoice::Every, SplitChoice::Ranges] {
-                            ui.selectable_value(&mut self.split, choice, choice.label());
+                            ui.selectable_value(&mut self.split, choice, choice.label(self.lang));
                         }
                     });
                 match self.split {
                     SplitChoice::None => {}
                     SplitChoice::Every => {
                         ui.horizontal(|ui| {
-                            ui.label("Каждые");
+                            ui.label(tr(self.lang, "Каждые"));
                             ui.add(
                                 egui::DragValue::new(&mut self.split_minutes)
                                     .range(1.0..=240.0)
                                     .speed(1.0)
-                                    .suffix(" мин"),
+                                    .suffix(format!(" {}", tr(self.lang, "мин"))),
                             );
                         });
                     }
@@ -2366,9 +2499,10 @@ impl App {
                                 .desired_width(190.0),
                         );
                         ui.label(
-                            RichText::new(
+                            RichText::new(tr(
+                                self.lang,
                                 "Начало-конец через запятую; пустой конец — до конца файла",
-                            )
+                            ))
                             .small()
                             .color(MUTED),
                         );
@@ -2376,9 +2510,12 @@ impl App {
                 }
                 if self.split != SplitChoice::None {
                     ui.label(
-                        RichText::new("Только MKV/WebM · резка по ключевым кадрам")
-                            .small()
-                            .color(MUTED),
+                        RichText::new(tr(
+                            self.lang,
+                            "Только MKV/WebM · резка по ключевым кадрам",
+                        ))
+                        .small()
+                        .color(MUTED),
                     );
                 }
 
@@ -2388,7 +2525,7 @@ impl App {
                         self.files
                             .get(self.selected)
                             .is_some_and(|f| f.info.is_some()),
-                        egui::Button::new("Применить правило ко всем"),
+                        egui::Button::new(tr(self.lang, "Применить правило ко всем")),
                     )
                     .clicked()
                 {
@@ -2402,24 +2539,34 @@ impl App {
             if self.files.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(120.0);
-                    ui.label(RichText::new("Перетащите MKV, MP4, MOV, WebM или AVI").size(20.0));
+                    ui.label(
+                        RichText::new(tr(self.lang, "Перетащите MKV, MP4, MOV, WebM или AVI"))
+                            .size(20.0),
+                    );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(
-                            "Покажу все дорожки: язык, название перевода, кодек, каналы и размер.\n\
+                        RichText::new(tr(
+                            self.lang,
+                            "Покажу все дорожки: язык, название перевода, кодек, каналы и размер. \
                              Отметьте ненужные — остальное скопируется без перекодирования.",
-                        )
+                        ))
                         .color(MUTED),
                     );
                     ui.add_space(14.0);
-                    if ui.button(RichText::new("Открыть файл…").size(16.0)).clicked() {
+                    if ui
+                        .button(RichText::new(tr(self.lang, "Открыть файл…")).size(16.0))
+                        .clicked()
+                    {
                         self.pick_files();
                     }
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("Ctrl+O — открыть · Ctrl+Enter — собрать · Esc — отмена")
-                            .small()
-                            .color(MUTED),
+                        RichText::new(tr(
+                            self.lang,
+                            "Ctrl+O — открыть · Ctrl+Enter — собрать · Esc — отмена",
+                        ))
+                        .small()
+                        .color(MUTED),
                     );
                 });
                 return;
@@ -2456,7 +2603,7 @@ impl App {
                     ui.label(RichText::new(entry.name()).size(18.0).strong());
                     if entry.probing {
                         ui.spinner();
-                        ui.label(RichText::new("читаю метаданные…").color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "читаю метаданные…")).color(MUTED));
                     }
                 });
                 ui.label(
@@ -2467,11 +2614,18 @@ impl App {
 
                 if let Some(error) = &entry.error {
                     ui.add_space(8.0);
-                    ui.colored_label(RED, format!("Не удалось прочитать файл: {error}"));
+                    ui.colored_label(
+                        RED,
+                        format!(
+                            "{}: {error}",
+                            tr(self.lang, "Не удалось прочитать файл")
+                        ),
+                    );
                     ui.label(
-                        RichText::new(
+                        RichText::new(tr(
+                            self.lang,
                             "Проверьте, что установлены ffprobe и mkvmerge (папка tools или PATH).",
-                        )
+                        ))
                         .small()
                         .color(MUTED),
                     );
@@ -2482,23 +2636,24 @@ impl App {
                     ui.add_space(20.0);
                     ui.vertical_centered(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Читаю дорожки…").color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "Читаю дорожки…")).color(MUTED));
                     });
                     return;
                 };
 
                 ui.add_space(6.0);
                 let meta = format!(
-                    "{}  ·  {}  ·  {}  ·  дорожек: {}",
+                    "{}  ·  {}  ·  {}  ·  {} {}",
                     if info.container.is_empty() {
-                        "контейнер неизвестен"
+                        tr(self.lang, "контейнер неизвестен")
                     } else {
                         &info.container
                     },
                     info.duration_ms
                         .map(format_duration)
-                        .unwrap_or_else(|| "длительность неизвестна".to_string()),
+                        .unwrap_or_else(|| tr(self.lang, "длительность неизвестна").to_string()),
                     format_size(entry.file_size),
+                    tr(self.lang, "дорожек:"),
                     info.streams.len()
                 );
                 ui.label(RichText::new(meta).color(MUTED).small());
@@ -2507,26 +2662,26 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Фильтр: язык, название, кодек…")
+                            .hint_text(tr(self.lang, "Фильтр: язык, название, кодек…"))
                             .desired_width(230.0),
                     );
                     ui.separator();
-                    if ui.button("Видео + лучшая аудио").clicked() {
+                    if ui.button(tr(self.lang, "Видео + лучшая аудио")).clicked() {
                         preset_action = Some(Preset::BestAudio);
                     }
-                    if ui.button("Видео + аудио").clicked() {
+                    if ui.button(tr(self.lang, "Видео + аудио")).clicked() {
                         preset_action = Some(Preset::VideoAudio);
                     }
-                    if ui.button("Всё").clicked() {
+                    if ui.button(tr(self.lang, "Всё")).clicked() {
                         preset_action = Some(Preset::Everything);
                     }
-                    if ui.button("Только русский").clicked() {
+                    if ui.button(tr(self.lang, "Только русский")).clicked() {
                         preset_action = Some(Preset::RussianOnly);
                     }
-                    if ui.button("Снять все").clicked() {
+                    if ui.button(tr(self.lang, "Снять все")).clicked() {
                         preset_action = Some(Preset::Nothing);
                     }
-                    if ui.button("Правило → все файлы").clicked() {
+                    if ui.button(tr(self.lang, "Правило → все файлы")).clicked() {
                         apply_all = true;
                     }
                 });
@@ -2537,14 +2692,20 @@ impl App {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Оставлено {kept} из {total} дорожек"))
-                            .color(if kept == 0 { RED } else { MUTED })
-                            .small(),
+                        RichText::new(format!(
+                            "{} {kept} {} {total} {}",
+                            tr(self.lang, "Оставлено"),
+                            tr(self.lang, "из"),
+                            tr(self.lang, "дорожек")
+                        ))
+                        .color(if kept == 0 { RED } else { MUTED })
+                        .small(),
                     );
                     ui.label(
                         RichText::new(format!(
-                            "· ~{} в выходе",
-                            format_size(total_kept_bytes(entry))
+                            "· ~{} {}",
+                            format_size(total_kept_bytes(entry)),
+                            tr(self.lang, "в выходе")
                         ))
                         .color(MUTED)
                         .small(),
@@ -2558,7 +2719,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Главы").strong());
+                    ui.label(RichText::new(tr(self.lang, "Главы")).strong());
                     if info.chapters_count > 0 {
                         ui.label(
                             RichText::new(format!("{}", info.chapters_count))
@@ -2570,7 +2731,7 @@ impl App {
                         if let Some(file) = &entry.chapters_file {
                             if ui
                                 .small_button("×")
-                                .on_hover_text("Не импортировать главы")
+                                .on_hover_text(tr(self.lang, "Не импортировать главы"))
                                 .clicked()
                             {
                                 chapters_clear = true;
@@ -2587,8 +2748,11 @@ impl App {
                             .on_hover_text(file.display().to_string());
                         }
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Импорт глав…"))
-                            .on_hover_text("Взять главы из другого MKV или из файла глав (XML/OGM)")
+                            .add_enabled(!busy, egui::Button::new(tr(self.lang, "Импорт глав…")))
+                            .on_hover_text(tr(
+                                self.lang,
+                                "Взять главы из другого MKV или из файла глав (XML/OGM)",
+                            ))
                             .clicked()
                         {
                             chapters_pick = true;
@@ -2598,15 +2762,25 @@ impl App {
                 if info.chapters.is_empty() {
                     ui.label(
                         RichText::new(if info.chapters_count > 0 {
-                            "Список глав не прочитан — mkvmerge скопирует их как есть."
+                            tr(
+                                self.lang,
+                                "Список глав не прочитан — mkvmerge скопирует их как есть.",
+                            )
                         } else {
-                            "Глав нет. Можно импортировать из другого файла."
+                            tr(
+                                self.lang,
+                                "Глав нет. Можно импортировать из другого файла.",
+                            )
                         })
                         .small()
                         .color(MUTED),
                     );
                 } else {
-                    egui::CollapsingHeader::new(format!("Список глав ({})", info.chapters.len()))
+                    egui::CollapsingHeader::new(format!(
+                        "{} ({})",
+                        tr(self.lang, "Список глав"),
+                        info.chapters.len()
+                    ))
                         .id_salt("chapters")
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
@@ -2630,7 +2804,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Дорожки из других файлов").strong());
+                    ui.label(RichText::new(tr(self.lang, "Дорожки из других файлов")).strong());
                     let extra_count: usize =
                         entry.extras.iter().map(|extra| extra.tracks.len()).sum();
                     if extra_count > 0 {
@@ -2642,8 +2816,8 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("＋ Взять из файла…"))
-                            .on_hover_text("Пришить аудио или субтитры из другого релиза")
+                            .add_enabled(!busy, egui::Button::new(tr(self.lang, "＋ Взять из файла…")))
+                            .on_hover_text(tr(self.lang, "Пришить аудио или субтитры из другого релиза"))
                             .clicked()
                         {
                             extra_pick = true;
@@ -2653,10 +2827,10 @@ impl App {
 
                 if entry.extras.is_empty() {
                     ui.label(
-                        RichText::new(
-                            "Например, озвучка из другого релиза: дорожка скопируется \
-                             в результат без перекодирования. Сдвиг в мс поправит рассинхрон.",
-                        )
+                        RichText::new(tr(
+                            self.lang,
+                            "Например, озвучка из другого релиза: дорожка скопируется в результат без перекодирования. Сдвиг в мс поправит рассинхрон.",
+                        ))
                         .small()
                         .color(MUTED),
                     );
@@ -2676,9 +2850,13 @@ impl App {
                             )
                             .on_hover_text(extra.info.path.display().to_string());
                             ui.label(
-                                RichText::new(format!("дорожек: {}", extra.tracks.len()))
-                                    .small()
-                                    .color(MUTED),
+                                RichText::new(format!(
+                                    "{} {}",
+                                    tr(self.lang, "дорожек:"),
+                                    extra.tracks.len()
+                                ))
+                                .small()
+                                .color(MUTED),
                             );
                         });
 
@@ -2687,7 +2865,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 let Some(stream) = &stream else {
                                     ui.label(
-                                        RichText::new("дорожка не найдена в файле")
+                                        RichText::new(tr(self.lang, "дорожка не найдена в файле"))
                                             .color(RED)
                                             .small(),
                                     );
@@ -2697,7 +2875,7 @@ impl App {
                                     RichText::new(format!(
                                         "{} {}",
                                         stream.kind.icon(),
-                                        stream.kind.label_ru()
+                                        kind_label(self.lang, stream.kind)
                                     ))
                                     .color(kind_color(stream.kind))
                                     .small(),
@@ -2710,31 +2888,34 @@ impl App {
                                         ))
                                         .small(),
                                     );
-                                ui.label(RichText::new("сдвиг").small().color(MUTED));
+                                ui.label(RichText::new(tr(self.lang, "сдвиг")).small().color(MUTED));
                                 ui.add(
                                     egui::DragValue::new(&mut track.delay_ms)
                                         .speed(10.0)
                                         .range(-600_000..=600_000)
-                                        .suffix(" мс"),
+                                        .suffix(format!(" {}", tr(self.lang, "мс"))),
                                 )
-                                .on_hover_text(
+                                .on_hover_text(tr(
+                                    self.lang,
                                     "Положительное значение — дорожка зазвучит позже",
-                                );
-                                ui.checkbox(&mut track.default, "Def").on_hover_text(
-                                    "Пометить дорожку как выбранную по умолчанию",
+                                ));
+                                ui.checkbox(&mut track.default, tr(self.lang, "По умолч.")).on_hover_text(
+                                    tr(self.lang, "Пометить дорожку как выбранную по умолчанию"),
                                 );
                                 if stream.kind == StreamKind::Audio && stream.ff_index.is_some() {
                                     if track.syncing {
                                         ui.add(egui::Spinner::new().size(12.0));
                                         ui.label(
-                                            RichText::new("сравниваю…").small().color(MUTED),
+                                            RichText::new(tr(self.lang, "сравниваю…"))
+                                                .small()
+                                                .color(MUTED),
                                         );
                                     } else if ui
                                         .add_enabled(!busy, egui::Button::new("⏱").small())
-                                        .on_hover_text(
-                                            "Подобрать сдвиг по звуку: сравнить с аудиодорожкой \
-                                             основного файла",
-                                        )
+                                        .on_hover_text(tr(
+                                            self.lang,
+                                            "Подобрать сдвиг по звуку: сравнить с аудиодорожкой основного файла",
+                                        ))
                                         .clicked()
                                     {
                                         extra_sync = Some((source_index, track.uid));
@@ -2744,17 +2925,17 @@ impl App {
                                     let label = if playing { "■" } else { "▶" };
                                     if ui
                                         .add(egui::Button::new(label).small())
-                                        .on_hover_text("Прослушать 15 секунд")
+                                        .on_hover_text(tr(self.lang, "Прослушать 15 секунд"))
                                         .clicked()
                                     {
                                         extra_preview = Some((source_index, track_index));
                                     }
                                     if ui
-                                        .add_enabled(!busy, egui::Button::new("кадр").small())
-                                        .on_hover_text(
-                                            "Окно синхрона: кадр из видео, обе дорожки вместе \
-                                             и подгонка сдвига",
-                                        )
+                                        .add_enabled(!busy, egui::Button::new(tr(self.lang, "кадр")).small())
+                                        .on_hover_text(tr(
+                                            self.lang,
+                                            "Окно синхрона: кадр из видео, обе дорожки вместе и подгонка сдвига",
+                                        ))
                                         .clicked()
                                     {
                                         sync_open = Some((source_index, track.uid));
@@ -2767,7 +2948,7 @@ impl App {
                                             egui::RichText::new("✕").color(RED).small(),
                                         ),
                                     )
-                                    .on_hover_text("Убрать дорожку из результата")
+                                    .on_hover_text(tr(self.lang, "Убрать дорожку из результата"))
                                     .clicked()
                                 {
                                     extra_remove = Some((source_index, track_index));
@@ -2776,7 +2957,7 @@ impl App {
                             if let Some(note) = &track.sync_note {
                                 ui.horizontal(|ui| {
                                     ui.add_space(18.0);
-                                    let color = if note.starts_with("не удалось") { RED } else { MUTED };
+                                    let color = if note.starts_with(tr(self.lang, "не удалось")) { RED } else { MUTED };
                                     ui.label(RichText::new(note).small().color(color));
                                 });
                             }
@@ -2788,7 +2969,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Склейка (append)").strong());
+                    ui.label(RichText::new(tr(self.lang, "Склейка (append)")).strong());
                     if !entry.append.is_empty() {
                         ui.label(
                             RichText::new(format!("+{}", entry.append.len()))
@@ -2798,11 +2979,12 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("＋ Приклеить файл…"))
-                            .on_hover_text(
+                            .add_enabled(!busy, egui::Button::new(tr(self.lang, "＋ Приклеить файл…")))
+                            .on_hover_text(tr(
+                                self.lang,
                                 "Дописать другой файл в конец результата. Кодеки и параметры \
                                  дорожек должны совпадать",
-                            )
+                            ))
                             .clicked()
                         {
                             append_pick = true;
@@ -2811,10 +2993,10 @@ impl App {
                 });
                 if entry.append.is_empty() {
                     ui.label(
-                        RichText::new(
-                            "Например, вторая часть фильма или продолжение серии — склеится \
-                             в один файл без перекодирования.",
-                        )
+                        RichText::new(tr(
+                            self.lang,
+                            "Например, вторая часть фильма или продолжение серии — склеится в один файл без перекодирования.",
+                        ))
                         .small()
                         .color(MUTED),
                     );
@@ -2845,7 +3027,7 @@ impl App {
                                     )
                                     .small(),
                                 )
-                                .on_hover_text("Убрать файл из склейки")
+                                .on_hover_text(tr(self.lang, "Убрать файл из склейки"))
                                 .clicked()
                             {
                                 append_remove = Some(index);
@@ -2869,8 +3051,8 @@ impl App {
                                 .spacing([10.0, 6.0])
                                 .show(ui, |ui| {
                                     for header in [
-                                        "", "Тип", "№", "Кодек", "Язык", "Название",
-                                        "Параметры", "Размер", "Def", "Forced", "Файл", "", "",
+                                        "", tr(self.lang, "Тип"), "№", tr(self.lang, "Кодек"), tr(self.lang, "Язык дорожки"), tr(self.lang, "Название"),
+                                        tr(self.lang, "Параметры"), tr(self.lang, "Размер"), tr(self.lang, "По умолч."), tr(self.lang, "Принуд."), tr(self.lang, "Файл"), "", "",
                                     ] {
                                         ui.label(RichText::new(header).strong().small());
                                     }
@@ -2879,10 +3061,10 @@ impl App {
                                     for (uid, stream) in info.streams.iter().enumerate() {
                                         let haystack = format!(
                                             "{} {} {} {}",
-                                            stream.display_name(),
-                                            stream.language_label(),
+                                            stream_name(self.lang, stream),
+                                            stream_language(self.lang, stream),
                                             stream.codec_display(),
-                                            stream.kind.label_ru()
+                                            kind_label(self.lang, stream.kind)
                                         )
                                         .to_ascii_lowercase();
                                         if !filter.is_empty() && !haystack.contains(&filter) {
@@ -2902,7 +3084,7 @@ impl App {
                                             RichText::new(format!(
                                                 "{} {}",
                                                 stream.kind.icon(),
-                                                stream.kind.label_ru()
+                                                kind_label(self.lang, stream.kind)
                                             ))
                                             .color(kind_color(stream.kind))
                                             .small(),
@@ -2916,12 +3098,12 @@ impl App {
 
                                         ui.label(stream.codec_display());
 
-                                        ui.label(stream.language_label());
+                                        ui.label(stream_language(self.lang, stream));
 
                                         let (name_text, color) = if stream.has_name() {
                                             (stream.display_name().to_string(), Color32::WHITE)
                                         } else {
-                                            ("Без названия".to_string(), MUTED)
+                                            (tr(self.lang, "Без названия").to_string(), MUTED)
                                         };
                                         ui.label(
                                             RichText::new(truncate_chars(&name_text, 34))
@@ -2930,7 +3112,7 @@ impl App {
                                         .on_hover_text(name_text);
 
                                         ui.label(
-                                            RichText::new(params_for(stream))
+                                            RichText::new(params_for(self.lang, stream))
                                                 .small()
                                                 .color(MUTED),
                                         );
@@ -2989,8 +3171,9 @@ impl App {
                                                     ),
                                                 )
                                                 .on_hover_text(format!(
-                                                    "Сохранить дорожку отдельным файлом .{ext}, \
-                                                     чтобы потом пришить к другому видео"
+                                                    "{} .{ext} — {}",
+                                                    tr(self.lang, "Сохранить дорожку отдельным файлом"),
+                                                    tr(self.lang, "чтобы потом пришить к другому видео")
                                                 ));
                                             if response.clicked() {
                                                 extract_request = Some(uid);
@@ -3006,9 +3189,10 @@ impl App {
                                             let label = if playing { "■" } else { "▶" };
                                             let response = ui
                                                 .add(egui::Button::new(label).small())
-                                                .on_hover_text(
+                                                .on_hover_text(tr(
+                                                    self.lang,
                                                     "Прослушать 15 секунд этой дорожки",
-                                                );
+                                                ));
                                             if response.clicked() {
                                                 preview_request = Some(uid);
                                             }
@@ -3024,9 +3208,9 @@ impl App {
                                             if shiftable {
                                                 let shifted = delay != 0;
                                                 let label = if shifted {
-                                                    format!("сдвиг {delay:+}")
+                                                    format!("{} {delay:+}", tr(self.lang, "сдвиг"))
                                                 } else {
-                                                    "сдвиг".to_string()
+                                                    tr(self.lang, "сдвиг").to_string()
                                                 };
                                                 let button = egui::Button::new(label).small();
                                                 let button = if shifted {
@@ -3038,13 +3222,17 @@ impl App {
                                                     .add(button)
                                                     .on_hover_text(if shifted {
                                                         format!(
-                                                            "Дорожка сдвинута на {delay:+} мс. \
-                                                             Открыть окно синхрона"
+                                                            "{} {delay:+} {}. {}",
+                                                            tr(self.lang, "Дорожка сдвинута на"),
+                                                            tr(self.lang, "мс"),
+                                                            tr(self.lang, "Открыть окно синхрона")
                                                         )
                                                     } else {
-                                                        "Окно синхрона: кадр из видео и сдвиг этой \
-                                                         дорожки относительно остальных"
-                                                            .to_string()
+                                                        tr(
+                                                            self.lang,
+                                                            "Окно синхрона: кадр из видео и сдвиг этой дорожки относительно остальных",
+                                                        )
+                                                        .to_string()
                                                     })
                                                     .clicked()
                                                 {
@@ -3053,7 +3241,7 @@ impl App {
                                             }
                                             if ui
                                                 .add(egui::Button::new("🏷").small())
-                                                .on_hover_text("Все теги дорожки")
+                                                .on_hover_text(tr(self.lang, "Все теги дорожки"))
                                                 .clicked()
                                             {
                                                 tags_request = Some(uid);
@@ -3078,7 +3266,10 @@ impl App {
                     ui.add_space(4.0);
                     ui.colored_label(
                         ORANGE,
-                        "Для MP4 текст субтитров нужно конвертировать в MOV text — включите опцию слева.",
+                        tr(
+                            self.lang,
+                            "Для MP4 текст субтитров нужно конвертировать в MOV text — включите опцию слева.",
+                        ),
                     );
                 }
             }
@@ -3110,7 +3301,7 @@ impl App {
                     }
                     entry.extras.retain(|extra| !extra.tracks.is_empty());
                 }
-                self.status = "Внешняя дорожка убрана".to_string();
+                self.status = tr(self.lang, "Внешняя дорожка убрана").to_string();
             }
             if let Some((source, uid)) = extra_preview {
                 self.preview_extra(source, uid);
@@ -3129,7 +3320,7 @@ impl App {
                     entry.chapters_file = None;
                     entry.chapters_label = None;
                 }
-                self.status = "Импорт глав отменён".into();
+                self.status = tr(self.lang, "Импорт глав отменён").into();
             }
             if chapters_pick {
                 self.pick_chapters_file();
@@ -3143,7 +3334,7 @@ impl App {
                         entry.append.remove(index);
                     }
                 }
-                self.status = "Файл убран из склейки".into();
+                self.status = tr(self.lang, "Файл убран из склейки").into();
             }
         });
     }
@@ -3155,9 +3346,12 @@ impl App {
             match &job_state {
                 JobState::Idle => {
                     ui.label(
-                        RichText::new("Готов к сборке: отметьте дорожки и нажмите «Собрать»")
-                            .color(MUTED)
-                            .small(),
+                        RichText::new(tr(
+                            self.lang,
+                            "Готов к сборке: отметьте дорожки и нажмите «Собрать»",
+                        ))
+                        .color(MUTED)
+                        .small(),
                     );
                 }
                 JobState::Running {
@@ -3173,7 +3367,7 @@ impl App {
                                 .color(MUTED),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Отмена").clicked() {
+                            if ui.button(tr(self.lang, "Отмена")).clicked() {
                                 self.request_cancel();
                             }
                         });
@@ -3186,10 +3380,22 @@ impl App {
                 }
                 JobState::Done { ok, failed } => {
                     let (text, color) = if *failed == 0 {
-                        (format!("Готово: {ok} файл(ов) собрано"), GREEN)
+                        (
+                            format!(
+                                "{}: {ok} {}",
+                                tr(self.lang, "Готово"),
+                                tr(self.lang, "файл(ов) собрано")
+                            ),
+                            GREEN,
+                        )
                     } else {
                         (
-                            format!("Завершено: успешно {ok}, с ошибками {failed}"),
+                            format!(
+                                "{}: {} {ok}, {} {failed}",
+                                tr(self.lang, "Завершено"),
+                                tr(self.lang, "успешно"),
+                                tr(self.lang, "с ошибками")
+                            ),
                             ORANGE,
                         )
                     };
@@ -3203,14 +3409,16 @@ impl App {
                 if ui
                     .add_enabled(
                         enabled,
-                        egui::Button::new(RichText::new("▶  Собрать").strong())
-                            .min_size(egui::vec2(130.0, 30.0)),
+                        egui::Button::new(
+                            RichText::new(format!("▶  {}", tr(self.lang, "Собрать"))).strong(),
+                        )
+                        .min_size(egui::vec2(130.0, 30.0)),
                     )
                     .clicked()
                 {
                     self.start_mux();
                 }
-                if self.is_busy() && ui.button("Остановить").clicked() {
+                if self.is_busy() && ui.button(tr(self.lang, "Остановить")).clicked() {
                     self.request_cancel();
                 }
 
@@ -3219,17 +3427,17 @@ impl App {
                 if self.preview.token.is_some() {
                     ui.separator();
                     ui.label(
-                        RichText::new("прослушивание включено")
+                        RichText::new(tr(self.lang, "прослушивание включено"))
                             .color(ACCENT)
                             .small(),
                     );
-                    if ui.small_button("стоп").clicked() {
+                    if ui.small_button(tr(self.lang, "стоп")).clicked() {
                         self.preview.stop();
                     }
                 }
             });
 
-            let title = format!("Лог ({})", self.log.len());
+            let title = format!("{} ({})", tr(self.lang, "Лог"), self.log.len());
             egui::CollapsingHeader::new(RichText::new(title).small())
                 .id_salt("log")
                 .show(ui, |ui| {
@@ -3243,7 +3451,9 @@ impl App {
                                 ui.label(RichText::new(line).monospace().small());
                             }
                             if self.log.is_empty() {
-                                ui.label(RichText::new("пусто").small().color(MUTED));
+                                ui.label(
+                                    RichText::new(tr(self.lang, "пусто")).small().color(MUTED),
+                                );
                             }
                         });
                 });
@@ -3265,76 +3475,91 @@ impl App {
         };
 
         let mut open = true;
-        egui::Window::new(format!("Дорожка №{} · {}", uid + 1, stream.display_name()))
-            .open(&mut open)
-            .default_width(560.0)
-            .default_height(420.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::Grid::new("tags_grid")
-                    .num_columns(2)
-                    .spacing([16.0, 4.0])
-                    .show(ui, |ui| {
-                        for (key, value) in [
-                            ("Тип", stream.kind.label_ru().to_string()),
-                            ("Кодек", stream.codec_display()),
-                            ("Сырой кодек", stream.codec_raw.clone()),
-                            ("Язык", stream.language_label()),
-                            ("Название", stream.display_name().to_string()),
-                            ("Каналы", stream.channels_label()),
-                            ("Layout", stream.channel_layout.clone().unwrap_or_default()),
-                            ("Частота", stream.sample_rate_label()),
-                            ("Разрешение", stream.resolution_label()),
-                            ("FPS", stream.fps_label()),
-                            ("Битрейт", stream.bitrate_label()),
-                            (
-                                "Длительность",
-                                stream.duration_ms.map(format_duration).unwrap_or_default(),
-                            ),
-                            (
-                                "Размер",
-                                stream
-                                    .size_bytes
-                                    .map(format_size)
-                                    .unwrap_or_else(|| "—".to_string()),
-                            ),
-                            ("Default", yes_no(stream.default)),
-                            ("Forced", yes_no(stream.forced)),
-                        ] {
-                            if value.is_empty() {
-                                continue;
-                            }
-                            ui.label(RichText::new(key).color(MUTED).small());
-                            ui.label(RichText::new(value).small());
-                            ui.end_row();
+        egui::Window::new(format!(
+            "{} {} · {}",
+            tr(self.lang, "Дорожка"),
+            uid + 1,
+            stream_name(self.lang, &stream)
+        ))
+        .open(&mut open)
+        .default_width(560.0)
+        .default_height(420.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            egui::Grid::new("tags_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    for (key, value) in [
+                        (
+                            tr(self.lang, "Тип"),
+                            kind_label(self.lang, stream.kind).to_string(),
+                        ),
+                        (tr(self.lang, "Кодек"), stream.codec_display()),
+                        (tr(self.lang, "Сырой кодек"), stream.codec_raw.clone()),
+                        (tr(self.lang, "Язык"), stream_language(self.lang, &stream)),
+                        (tr(self.lang, "Название"), stream_name(self.lang, &stream)),
+                        (tr(self.lang, "Каналы"), stream_channels(self.lang, &stream)),
+                        ("Layout", stream.channel_layout.clone().unwrap_or_default()),
+                        (tr(self.lang, "Частота"), stream.sample_rate_label()),
+                        (tr(self.lang, "Разрешение"), stream.resolution_label()),
+                        ("FPS", stream.fps_label()),
+                        (tr(self.lang, "Битрейт"), stream.bitrate_label()),
+                        (
+                            tr(self.lang, "Длительность"),
+                            stream.duration_ms.map(format_duration).unwrap_or_default(),
+                        ),
+                        (
+                            tr(self.lang, "Размер"),
+                            stream
+                                .size_bytes
+                                .map(format_size)
+                                .unwrap_or_else(|| "—".to_string()),
+                        ),
+                        (
+                            tr(self.lang, "По умолч."),
+                            yes_no(self.lang, stream.default),
+                        ),
+                        (tr(self.lang, "Принуд."), yes_no(self.lang, stream.forced)),
+                    ] {
+                        if value.is_empty() {
+                            continue;
                         }
-                    });
+                        ui.label(RichText::new(key).color(MUTED).small());
+                        ui.label(RichText::new(value).small());
+                        ui.end_row();
+                    }
+                });
 
-                ui.separator();
-                ui.label(RichText::new("Теги из контейнера").strong());
-                if stream.tags.is_empty() {
-                    ui.label(RichText::new("Тегов нет").color(MUTED).small());
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("tags_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            egui::Grid::new("tags_values")
-                                .num_columns(2)
-                                .striped(true)
-                                .spacing([14.0, 4.0])
-                                .show(ui, |ui| {
-                                    let mut tags: Vec<_> = stream.tags.iter().collect();
-                                    tags.sort_by(|a, b| a.0.cmp(b.0));
-                                    for (key, value) in tags {
-                                        ui.label(RichText::new(key).small().color(ACCENT));
-                                        ui.label(RichText::new(value).small());
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                }
-            });
+            ui.separator();
+            ui.label(RichText::new(tr(self.lang, "Теги из контейнера")).strong());
+            if stream.tags.is_empty() {
+                ui.label(
+                    RichText::new(tr(self.lang, "Тегов нет"))
+                        .color(MUTED)
+                        .small(),
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("tags_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("tags_values")
+                            .num_columns(2)
+                            .striped(true)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                let mut tags: Vec<_> = stream.tags.iter().collect();
+                                tags.sort_by(|a, b| a.0.cmp(b.0));
+                                for (key, value) in tags {
+                                    ui.label(RichText::new(key).small().color(ACCENT));
+                                    ui.label(RichText::new(value).small());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+        });
 
         if !open {
             self.tags_open = None;
@@ -3350,7 +3575,7 @@ impl App {
         let mut add = false;
         let mut close = false;
 
-        egui::Window::new("Взять дорожку из другого файла")
+        egui::Window::new(tr(self.lang, "Взять дорожку из другого файла"))
             .open(&mut open)
             .default_width(780.0)
             .default_height(460.0)
@@ -3364,11 +3589,15 @@ impl App {
                 ui.add_space(4.0);
 
                 if let Some(err) = &pick.error {
-                    ui.colored_label(RED, format!("Не удалось прочитать файл: {err}"));
+                    ui.colored_label(
+                        RED,
+                        format!("{}: {err}", tr(self.lang, "Не удалось прочитать файл")),
+                    );
                     ui.label(
-                        RichText::new(
+                        RichText::new(tr(
+                            self.lang,
                             "Нужны ffprobe или mkvmerge: папка tools рядом с программой или PATH.",
-                        )
+                        ))
                         .small()
                         .color(MUTED),
                     );
@@ -3378,7 +3607,7 @@ impl App {
                 let Some(info) = pick.info.clone() else {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Читаю дорожки…").color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "Читаю дорожки…")).color(MUTED));
                     });
                     return;
                 };
@@ -3397,8 +3626,14 @@ impl App {
                             .striped(true)
                             .spacing([10.0, 6.0])
                             .show(ui, |ui| {
-                                for header in ["", "Тип", "Кодек", "Язык", "Название", "Параметры"]
-                                {
+                                for header in [
+                                    "",
+                                    tr(self.lang, "Тип"),
+                                    tr(self.lang, "Кодек"),
+                                    tr(self.lang, "Язык дорожки"),
+                                    tr(self.lang, "Название"),
+                                    tr(self.lang, "Параметры"),
+                                ] {
                                     ui.label(RichText::new(header).strong().small());
                                 }
                                 ui.end_row();
@@ -3413,16 +3648,18 @@ impl App {
                                         RichText::new(format!(
                                             "{} {}",
                                             stream.kind.icon(),
-                                            stream.kind.label_ru()
+                                            kind_label(self.lang, stream.kind)
                                         ))
                                         .color(kind_color(stream.kind))
                                         .small(),
                                     );
                                     ui.label(stream.codec_display());
-                                    ui.label(stream.language_label());
-                                    ui.label(truncate_chars(stream.display_name(), 34));
+                                    ui.label(stream_language(self.lang, stream));
+                                    ui.label(truncate_chars(&stream_name(self.lang, stream), 34));
                                     ui.label(
-                                        RichText::new(params_for(stream)).small().color(MUTED),
+                                        RichText::new(params_for(self.lang, stream))
+                                            .small()
+                                            .color(MUTED),
                                     );
                                     ui.end_row();
                                 }
@@ -3431,18 +3668,18 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.small_button("Только аудио").clicked() {
+                    if ui.small_button(tr(self.lang, "Только аудио")).clicked() {
                         for (uid, stream) in info.streams.iter().enumerate() {
                             pick.selected[uid] = stream.kind == StreamKind::Audio;
                         }
                     }
-                    if ui.small_button("Снять все").clicked() {
+                    if ui.small_button(tr(self.lang, "Снять все")).clicked() {
                         pick.selected.iter_mut().for_each(|value| *value = false);
                     }
                     let chosen = pick.selected.iter().filter(|value| **value).count();
                     ui.separator();
                     ui.label(
-                        RichText::new(format!("выбрано: {chosen}"))
+                        RichText::new(format!("{} {chosen}", tr(self.lang, "выбрано:")))
                             .small()
                             .color(MUTED),
                     );
@@ -3454,13 +3691,13 @@ impl App {
                     if ui
                         .add_enabled(
                             chosen > 0,
-                            egui::Button::new(RichText::new("Добавить").strong()),
+                            egui::Button::new(RichText::new(tr(self.lang, "Добавить")).strong()),
                         )
                         .clicked()
                     {
                         add = true;
                     }
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(tr(self.lang, "Отмена")).clicked() {
                         close = true;
                     }
                 });
@@ -3488,7 +3725,7 @@ impl App {
                 .collect();
 
             if tracks.is_empty() {
-                self.status = "Ничего не выбрано".to_string();
+                self.status = tr(self.lang, "Ничего не выбрано").to_string();
                 self.extra_pick = Some(pick);
                 return;
             }
@@ -3511,7 +3748,7 @@ impl App {
                     });
                 }
                 let added: usize = entry.extras.iter().map(|extra| extra.tracks.len()).sum();
-                self.status = format!("Внешних дорожек: {added}");
+                self.status = format!("{} {added}", tr(self.lang, "Внешних дорожек:"));
             }
             return;
         }
@@ -3536,7 +3773,7 @@ impl App {
         painter.text(
             screen.center(),
             egui::Align2::CENTER_CENTER,
-            "Отпустите файлы, чтобы добавить",
+            tr(self.lang, "Отпустите файлы, чтобы добавить"),
             egui::FontId::proportional(26.0),
             Color32::WHITE,
         );
@@ -3590,11 +3827,11 @@ fn main_audio_uid(info: &MediaInfo, keep: &[bool]) -> Option<usize> {
         .map(|(uid, _)| uid)
 }
 
-fn params_for(stream: &StreamInfo) -> String {
+fn params_for(lang: Lang, stream: &StreamInfo) -> String {
     let parts: Vec<String> = match stream.kind {
         StreamKind::Video => vec![stream.resolution_label(), stream.fps_label()],
         StreamKind::Audio => vec![
-            stream.channels_label(),
+            stream_channels(lang, stream),
             stream.sample_rate_label(),
             stream.bitrate_label(),
         ],
@@ -3622,6 +3859,57 @@ fn kind_color(kind: StreamKind) -> Color32 {
     }
 }
 
+/// Название типа дорожки на выбранном языке.
+fn kind_label(lang: Lang, kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Video => tr(lang, "Видео"),
+        StreamKind::Audio => tr(lang, "Аудио"),
+        StreamKind::Subtitle => tr(lang, "Субтитры"),
+        StreamKind::Button => tr(lang, "Кнопки"),
+        StreamKind::Attachment => tr(lang, "Вложение"),
+        StreamKind::Other => tr(lang, "Прочее"),
+    }
+}
+
+/// Название дорожки: заголовок из контейнера или «Без названия».
+fn stream_name(lang: Lang, stream: &StreamInfo) -> String {
+    if stream.has_name() {
+        stream
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    } else {
+        tr(lang, "Без названия").to_string()
+    }
+}
+
+/// Язык дорожки с расшифровкой кода на выбранном языке интерфейса.
+fn stream_language(lang: Lang, stream: &StreamInfo) -> String {
+    match stream.language.as_deref().map(str::trim) {
+        Some(code) if !code.is_empty() && code != "und" => {
+            match trackcut_core::model::language_name(code) {
+                Some(name) => format!("{code} — {}", crate::i18n::tr_dyn(lang, name)),
+                None => code.to_uppercase(),
+            }
+        }
+        _ => tr(lang, "не указан").to_string(),
+    }
+}
+
+/// Каналы дорожки: «1.0 (моно)», «2.0 (стерео)», «5.1», «6 кан.»…
+fn stream_channels(lang: Lang, stream: &StreamInfo) -> String {
+    match stream.channels {
+        None => String::new(),
+        Some(1) => tr(lang, "1.0 (моно)").to_string(),
+        Some(2) => tr(lang, "2.0 (стерео)").to_string(),
+        Some(6) => "5.1".to_string(),
+        Some(8) => "7.1".to_string(),
+        Some(n) => format!("{n} {}", tr(lang, "кан.")),
+    }
+}
+
 fn audio_score(stream: &StreamInfo) -> u64 {
     let language_bonus = stream
         .language
@@ -3640,9 +3928,9 @@ fn audio_score(stream: &StreamInfo) -> u64 {
     language_bonus + channels + bitrate
 }
 
-fn yes_no(value: bool) -> String {
+fn yes_no(lang: Lang, value: bool) -> String {
     if value {
-        "да".to_string()
+        tr(lang, "Да").to_string()
     } else {
         "—".to_string()
     }
