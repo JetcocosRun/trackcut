@@ -15,8 +15,8 @@ use trackcut_core::{
 };
 
 use crate::preview::{
-    request_frame, start_pair_preview, start_preview, start_video_segment, FrameMsg, PreviewMsg,
-    PreviewState, VideoFrame,
+    request_frame, start_pair_preview, start_preview, start_track_preview, start_video_segment,
+    FrameMsg, PreviewMsg, PreviewState, VideoFrame,
 };
 
 const ACCENT: Color32 = Color32::from_rgb(96, 165, 250);
@@ -122,6 +122,7 @@ struct FileEntry {
     keep: Vec<bool>,
     default_flag: Vec<bool>,
     forced_flag: Vec<bool>,
+    keep_delay: Vec<i64>,
     extras: Vec<ExtraSource>,
     chapters_file: Option<PathBuf>,
     chapters_label: Option<String>,
@@ -142,6 +143,7 @@ impl FileEntry {
             keep: Vec::new(),
             default_flag: Vec::new(),
             forced_flag: Vec::new(),
+            keep_delay: Vec::new(),
             extras: Vec::new(),
             chapters_file: None,
             chapters_label: None,
@@ -160,6 +162,7 @@ impl FileEntry {
             .collect();
         self.default_flag = info.streams.iter().map(|stream| stream.default).collect();
         self.forced_flag = info.streams.iter().map(|stream| stream.forced).collect();
+        self.keep_delay = vec![0; info.streams.len()];
     }
 
     fn name(&self) -> String {
@@ -180,6 +183,7 @@ enum ProbeMsg {
     SyncDone {
         source: usize,
         uid: usize,
+        internal: bool,
         result: Result<OffsetEstimate, String>,
     },
 }
@@ -258,6 +262,7 @@ struct Job {
 struct SyncWindow {
     source: usize,
     uid: usize,
+    internal: bool,
     time_ms: u64,
     delay_ms: i64,
     texture: Option<egui::TextureHandle>,
@@ -479,9 +484,10 @@ impl App {
                 ProbeMsg::SyncDone {
                     source,
                     uid,
+                    internal,
                     result,
                 } => {
-                    self.apply_sync_result(source, uid, result);
+                    self.apply_sync_result(source, uid, internal, result);
                     continue;
                 }
             };
@@ -788,6 +794,7 @@ impl App {
                     uid: *uid,
                     default: Some(entry.default_flag.get(*uid).copied().unwrap_or(false)),
                     forced: Some(entry.forced_flag.get(*uid).copied().unwrap_or(false)),
+                    delay_ms: entry.keep_delay.get(*uid).copied().unwrap_or(0),
                 })
                 .collect();
 
@@ -1000,36 +1007,45 @@ impl App {
         self.play_preview(info, uid, token);
     }
 
-    /// Открывает окно синхрона для внешней аудиодорожки.
-    fn open_sync_window(&mut self, source: usize, uid: usize) {
+    /// Открывает окно синхрона: `internal` — дорожка самого файла, иначе внешняя.
+    fn open_sync_window(&mut self, source: usize, uid: usize, internal: bool) {
         let Some(entry) = self.files.get(self.selected) else {
             return;
         };
         let Some(info) = &entry.info else {
             return;
         };
-        let Some(extra) = entry.extras.get(source) else {
-            return;
+        let (delay_ms, kind) = if internal {
+            let Some(stream) = info.streams.get(uid) else {
+                return;
+            };
+            (entry.keep_delay.get(uid).copied().unwrap_or(0), stream.kind)
+        } else {
+            let Some(extra) = entry.extras.get(source) else {
+                return;
+            };
+            let Some(stream) = extra.info.streams.get(uid) else {
+                return;
+            };
+            let delay = extra
+                .tracks
+                .iter()
+                .find(|track| track.uid == uid)
+                .map(|track| track.delay_ms)
+                .unwrap_or(0);
+            (delay, stream.kind)
         };
-        let Some(stream) = extra.info.streams.get(uid) else {
-            return;
-        };
-        if stream.kind != StreamKind::Audio {
-            self.status = "Окно синхрона доступно только для аудио".to_string();
+        if kind != StreamKind::Audio && kind != StreamKind::Subtitle {
+            self.status = "Сдвиг задаётся для аудио и субтитров".to_string();
             return;
         }
-        let delay_ms = extra
-            .tracks
-            .iter()
-            .find(|track| track.uid == uid)
-            .map(|track| track.delay_ms)
-            .unwrap_or(0);
         let time_ms = trackcut_core::preview::preview_start_ms(info.duration_ms);
 
         self.stop_sync_playback();
         self.sync_window = Some(SyncWindow {
             source,
             uid,
+            internal,
             time_ms,
             delay_ms,
             texture: None,
@@ -1106,10 +1122,16 @@ impl App {
 
     fn play_sync_pair(&mut self) {
         self.stop_sync_playback();
-        let Some((source, uid, at_ms, delay_ms)) = self
-            .sync_window
-            .as_ref()
-            .map(|window| (window.source, window.uid, window.time_ms, window.delay_ms))
+        let Some((source, uid, at_ms, delay_ms, internal)) =
+            self.sync_window.as_ref().map(|window| {
+                (
+                    window.source,
+                    window.uid,
+                    window.time_ms,
+                    window.delay_ms,
+                    window.internal,
+                )
+            })
         else {
             return;
         };
@@ -1119,36 +1141,65 @@ impl App {
         let Some(info) = entry.info.clone() else {
             return;
         };
-        let Some(extra) = entry.extras.get(source).cloned() else {
-            return;
-        };
         if self.tools.ffmpeg.is_none() {
             self.status = "Для прослушивания нужен ffmpeg".to_string();
             return;
         }
-        let Some(main_uid) = main_audio_uid(&info, &entry.keep) else {
-            self.status = "В основном файле нет аудиодорожки".to_string();
-            return;
-        };
-        let Some(main_ff) = info
-            .streams
-            .get(main_uid)
-            .and_then(|stream| stream.ff_index)
-        else {
-            self.status = "У основной дорожки нет индекса для декодирования".to_string();
-            return;
-        };
-        let Some(extra_ff) = extra
-            .info
-            .streams
-            .get(uid)
-            .and_then(|stream| stream.ff_index)
-        else {
-            self.status = "У внешней дорожки нет индекса для декодирования".to_string();
-            return;
-        };
 
         let token = SYNC_TOKEN_BASE + uid as u64;
+        let main_path = info.path.clone();
+        let stop = if internal {
+            let Some(ff_index) = info.streams.get(uid).and_then(|stream| stream.ff_index) else {
+                self.status = "У этой дорожки нет индекса для декодирования".to_string();
+                return;
+            };
+            start_track_preview(
+                self.tools.clone(),
+                info.clone(),
+                ff_index,
+                at_ms,
+                delay_ms,
+                token,
+                self.preview_tx.clone(),
+            )
+        } else {
+            let Some(extra) = entry.extras.get(source).cloned() else {
+                return;
+            };
+            let Some(main_uid) = main_audio_uid(&info, &entry.keep) else {
+                self.status = "В основном файле нет аудиодорожки".to_string();
+                return;
+            };
+            let Some(main_ff) = info
+                .streams
+                .get(main_uid)
+                .and_then(|stream| stream.ff_index)
+            else {
+                self.status = "У основной дорожки нет индекса для декодирования".to_string();
+                return;
+            };
+            let Some(extra_ff) = extra
+                .info
+                .streams
+                .get(uid)
+                .and_then(|stream| stream.ff_index)
+            else {
+                self.status = "У внешней дорожки нет индекса для декодирования".to_string();
+                return;
+            };
+            start_pair_preview(
+                self.tools.clone(),
+                info.clone(),
+                main_ff,
+                extra.info.clone(),
+                extra_ff,
+                at_ms,
+                delay_ms,
+                token,
+                self.preview_tx.clone(),
+            )
+        };
+
         let video = info
             .streams
             .iter()
@@ -1164,19 +1215,6 @@ impl App {
                     .unwrap_or(360);
                 (stream.ff_index, width, height)
             });
-        let main_path = info.path.clone();
-
-        let stop = start_pair_preview(
-            self.tools.clone(),
-            info,
-            main_ff,
-            extra.info.clone(),
-            extra_ff,
-            at_ms,
-            delay_ms,
-            token,
-            self.preview_tx.clone(),
-        );
 
         let mut video_stop = None;
         let mut video_rx = None;
@@ -1217,19 +1255,31 @@ impl App {
             .files
             .get(self.selected)
             .and_then(|entry| entry.info.clone());
-        let extra_name = self
-            .files
-            .get(self.selected)
-            .and_then(|entry| entry.extras.get(window.source))
-            .map(|extra| extra.name())
-            .unwrap_or_default();
-        let track_label = self
-            .files
-            .get(self.selected)
-            .and_then(|entry| entry.extras.get(window.source))
-            .and_then(|extra| extra.info.streams.get(window.uid))
-            .map(|stream| stream.display_name().to_string())
-            .unwrap_or_default();
+        let extra_name = if window.internal {
+            self.files
+                .get(self.selected)
+                .map(|entry| entry.name())
+                .unwrap_or_default()
+        } else {
+            self.files
+                .get(self.selected)
+                .and_then(|entry| entry.extras.get(window.source))
+                .map(|extra| extra.name())
+                .unwrap_or_default()
+        };
+        let track_label = if window.internal {
+            main_info
+                .as_ref()
+                .and_then(|info| info.streams.get(window.uid))
+                .map(|stream| stream.display_name().to_string())
+        } else {
+            self.files
+                .get(self.selected)
+                .and_then(|entry| entry.extras.get(window.source))
+                .and_then(|extra| extra.info.streams.get(window.uid))
+                .map(|stream| stream.display_name().to_string())
+        }
+        .unwrap_or_default();
         let duration_ms = main_info
             .as_ref()
             .and_then(|info| info.duration_ms)
@@ -1257,14 +1307,14 @@ impl App {
                         ui.label(RichText::new(&track_label).small().color(MUTED));
                     }
                 });
-                ui.label(
-                    RichText::new(
-                        "Кадр из основного файла, обе дорожки звучат вместе. Двигайте сдвиг, \
-                         пока речь не совпадёт. Положительный сдвиг — внешняя позже.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
+                let hint = if window.internal {
+                    "Дорожка из этого файла со сдвигом относительно остальных. \
+                     Видно кадр и слышно, как звук ложится на видео."
+                } else {
+                    "Кадр из основного файла, обе дорожки звучат вместе. Двигайте сдвиг, \
+                     пока речь не совпадёт. Положительный сдвиг — внешняя позже."
+                };
+                ui.label(RichText::new(hint).small().color(MUTED));
 
                 ui.add_space(4.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1378,13 +1428,16 @@ impl App {
                     };
                     if ui
                         .add_enabled(has_ffmpeg, egui::Button::new(label))
-                        .on_hover_text(
+                        .on_hover_text(if window.internal {
+                            "Видео и эта дорожка со сдвигом играют вместе 12 секунд — \
+                             видно и слышно, как звук ложится на картинку"
+                        } else {
                             "Видео и обе дорожки играют вместе 12 секунд — видно и слышно, \
-                             как ложится сдвиг",
-                        )
+                             как ложится сдвиг"
+                        })
                         .clicked()
                     {
-                        if window.playing {
+                        if window.playing || window.video_playing {
                             stop_play = true;
                         } else {
                             play = true;
@@ -1421,8 +1474,13 @@ impl App {
         }
 
         // Сдвиг из окна сразу попадает в дорожку — в таблице видно то же число.
+        let internal = window.internal;
         if let Some(entry) = self.files.get_mut(self.selected) {
-            if let Some(extra) = entry.extras.get_mut(source) {
+            if internal {
+                if let Some(slot) = entry.keep_delay.get_mut(uid) {
+                    *slot = window.delay_ms;
+                }
+            } else if let Some(extra) = entry.extras.get_mut(source) {
                 if let Some(track) = extra.tracks.iter_mut().find(|track| track.uid == uid) {
                     track.delay_ms = window.delay_ms;
                 }
@@ -1439,15 +1497,19 @@ impl App {
             self.play_sync_pair();
         }
         if auto {
-            self.estimate_extra_delay(source, uid);
-            if let Some(window) = self.sync_window.as_mut() {
-                window.syncing = self
-                    .files
-                    .get(self.selected)
-                    .and_then(|entry| entry.extras.get(source))
-                    .and_then(|extra| extra.tracks.iter().find(|track| track.uid == uid))
-                    .map(|track| track.syncing)
-                    .unwrap_or(false);
+            if internal {
+                self.estimate_internal_delay(uid);
+            } else {
+                self.estimate_extra_delay(source, uid);
+                if let Some(window) = self.sync_window.as_mut() {
+                    window.syncing = self
+                        .files
+                        .get(self.selected)
+                        .and_then(|entry| entry.extras.get(source))
+                        .and_then(|extra| extra.tracks.iter().find(|track| track.uid == uid))
+                        .map(|track| track.syncing)
+                        .unwrap_or(false);
+                }
             }
         }
 
@@ -1508,6 +1570,60 @@ impl App {
             let _ = tx.send(ProbeMsg::SyncDone {
                 source,
                 uid,
+                internal: false,
+                result,
+            });
+        });
+    }
+
+    /// Подбирает сдвиг дорожки внутри файла: сравнивает её с другой аудиодорожкой.
+    fn estimate_internal_delay(&mut self, uid: usize) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(entry) = self.files.get(self.selected) else {
+            return;
+        };
+        let Some(info) = entry.info.clone() else {
+            return;
+        };
+        if info.streams.get(uid).map(|stream| stream.kind) != Some(StreamKind::Audio) {
+            self.status = "Сдвиг подбирается только для аудио".to_string();
+            return;
+        }
+        if self.tools.ffmpeg.is_none() {
+            self.status = "Для подбора сдвига нужен ffmpeg".to_string();
+            return;
+        }
+
+        let reference = main_audio_uid(&info, &entry.keep)
+            .filter(|main| *main != uid)
+            .or_else(|| {
+                info.streams
+                    .iter()
+                    .enumerate()
+                    .find(|(index, stream)| *index != uid && stream.kind == StreamKind::Audio)
+                    .map(|(index, _)| index)
+            });
+        let Some(reference) = reference else {
+            self.status = "В файле только одна аудиодорожка — сравнивать не с чем".to_string();
+            return;
+        };
+
+        if let Some(window) = self.sync_window.as_mut() {
+            window.syncing = true;
+            window.sync_note = None;
+        }
+        let tools = self.tools.clone();
+        let tx = self.probe_tx.clone();
+        self.status = "Сравниваю звук дорожек…".to_string();
+        std::thread::spawn(move || {
+            let result =
+                estimate_delay(&tools, &info, reference, &info, uid).map_err(|err| err.to_string());
+            let _ = tx.send(ProbeMsg::SyncDone {
+                source: 0,
+                uid,
+                internal: true,
                 result,
             });
         });
@@ -1517,52 +1633,94 @@ impl App {
         &mut self,
         source: usize,
         uid: usize,
+        internal: bool,
         result: Result<OffsetEstimate, String>,
     ) {
         let selected = self.selected;
-        let Some(entry) = self.files.get_mut(selected) else {
-            return;
-        };
-        let Some(extra) = entry.extras.get_mut(source) else {
-            return;
-        };
-        let Some(track) = extra.tracks.iter_mut().find(|track| track.uid == uid) else {
-            return;
-        };
-        track.syncing = false;
+        let note_text;
+        let mut delay_value = 0;
         let estimated_ok = result.is_ok();
-        match result {
-            Ok(estimate) => {
-                track.delay_ms = estimate.delay_ms;
-                let sign = if estimate.delay_ms > 0 { "+" } else { "" };
-                track.sync_note = Some(format!(
-                    "{sign}{} мс · окна {}/{} · совпадение {:.0}%",
-                    estimate.delay_ms,
-                    estimate.windows_agree,
-                    estimate.windows_total,
-                    estimate.score.max(0.0) * 100.0
-                ));
-                self.status = match estimate.warnings.first() {
-                    Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
-                    None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
-                };
-                for warning in &estimate.warnings {
-                    self.log.push(format!("Сдвиг: {warning}"));
+
+        if internal {
+            note_text = match &result {
+                Ok(estimate) => {
+                    delay_value = estimate.delay_ms;
+                    self.status = match estimate.warnings.first() {
+                        Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
+                        None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
+                    };
+                    for warning in &estimate.warnings {
+                        self.log.push(format!("Сдвиг: {warning}"));
+                    }
+                    Some(format!(
+                        "{}{} мс · окна {}/{} · совпадение {:.0}%",
+                        if estimate.delay_ms > 0 { "+" } else { "" },
+                        estimate.delay_ms,
+                        estimate.windows_agree,
+                        estimate.windows_total,
+                        estimate.score.max(0.0) * 100.0
+                    ))
+                }
+                Err(err) => {
+                    self.status = "Не удалось подобрать сдвиг".to_string();
+                    Some(format!("не удалось: {err}"))
+                }
+            };
+            if estimated_ok {
+                if let Some(entry) = self.files.get_mut(selected) {
+                    if let Some(slot) = entry.keep_delay.get_mut(uid) {
+                        *slot = delay_value;
+                    }
                 }
             }
-            Err(err) => {
-                track.sync_note = Some(format!("не удалось: {err}"));
-                self.status = "Не удалось подобрать сдвиг".to_string();
+        } else {
+            let Some(entry) = self.files.get_mut(selected) else {
+                return;
+            };
+            let Some(extra) = entry.extras.get_mut(source) else {
+                return;
+            };
+            let Some(track) = extra.tracks.iter_mut().find(|track| track.uid == uid) else {
+                return;
+            };
+            track.syncing = false;
+            match result {
+                Ok(estimate) => {
+                    track.delay_ms = estimate.delay_ms;
+                    delay_value = estimate.delay_ms;
+                    let sign = if estimate.delay_ms > 0 { "+" } else { "" };
+                    track.sync_note = Some(format!(
+                        "{sign}{} мс · окна {}/{} · совпадение {:.0}%",
+                        estimate.delay_ms,
+                        estimate.windows_agree,
+                        estimate.windows_total,
+                        estimate.score.max(0.0) * 100.0
+                    ));
+                    self.status = match estimate.warnings.first() {
+                        Some(warning) => format!("Сдвиг {} мс, но {warning}", estimate.delay_ms),
+                        None => format!("Сдвиг подобран: {} мс", estimate.delay_ms),
+                    };
+                    for warning in &estimate.warnings {
+                        self.log.push(format!("Сдвиг: {warning}"));
+                    }
+                }
+                Err(err) => {
+                    track.sync_note = Some(format!("не удалось: {err}"));
+                    self.status = "Не удалось подобрать сдвиг".to_string();
+                }
             }
+            note_text = track.sync_note.clone();
         }
-        let note = track.sync_note.clone();
-        let delay = track.delay_ms;
+
         if let Some(window) = self.sync_window.as_mut() {
-            if window.source == source && window.uid == uid {
+            if window.internal == internal
+                && window.uid == uid
+                && (internal || window.source == source)
+            {
                 window.syncing = false;
-                window.sync_note = note;
+                window.sync_note = note_text;
                 if estimated_ok {
-                    window.delay_ms = delay;
+                    window.delay_ms = delay_value;
                 }
             }
         }
@@ -2280,6 +2438,7 @@ impl App {
             let mut extra_preview: Option<(usize, usize)> = None;
             let mut extra_sync: Option<(usize, usize)> = None;
             let mut sync_open: Option<(usize, usize)> = None;
+            let mut sync_internal: Option<usize> = None;
             let mut extra_remove: Option<(usize, usize)> = None;
             let mut extra_pick = false;
             let mut apply_all = false;
@@ -2857,13 +3016,36 @@ impl App {
                                             ui.label("");
                                         }
 
-                                        if ui
-                                            .add(egui::Button::new("🏷").small())
-                                            .on_hover_text("Все теги дорожки")
-                                            .clicked()
-                                        {
-                                            tags_request = Some(uid);
-                                        }
+                                        ui.horizontal(|ui| {
+                                            let delay =
+                                                entry.keep_delay.get(uid).copied().unwrap_or(0);
+                                            let shiftable = stream.kind == StreamKind::Audio
+                                                || stream.kind == StreamKind::Subtitle;
+                                            if shiftable {
+                                                let label = if delay == 0 {
+                                                    "сдвиг".to_string()
+                                                } else {
+                                                    format!("{delay:+} мс")
+                                                };
+                                                if ui
+                                                    .add(egui::Button::new(label).small())
+                                                    .on_hover_text(
+                                                        "Окно синхрона: кадр из видео и сдвиг этой \
+                                                         дорожки относительно остальных",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    sync_internal = Some(uid);
+                                                }
+                                            }
+                                            if ui
+                                                .add(egui::Button::new("🏷").small())
+                                                .on_hover_text("Все теги дорожки")
+                                                .clicked()
+                                            {
+                                                tags_request = Some(uid);
+                                            }
+                                        });
 
                                         ui.end_row();
                                     }
@@ -2924,7 +3106,10 @@ impl App {
                 self.estimate_extra_delay(source, uid);
             }
             if let Some((source, uid)) = sync_open {
-                self.open_sync_window(source, uid);
+                self.open_sync_window(source, uid, false);
+            }
+            if let Some(uid) = sync_internal {
+                self.open_sync_window(0, uid, true);
             }
             if chapters_clear {
                 if let Some(entry) = self.files.get_mut(self.selected) {

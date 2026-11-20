@@ -17,6 +17,9 @@ pub struct KeepTrack {
     /// Переопределить флаг Forced в выходном файле.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced: Option<bool>,
+    /// Сдвиг этой дорожки в миллисекундах: положительный — позже, отрицательный — раньше.
+    #[serde(default)]
+    pub delay_ms: i64,
 }
 
 impl KeepTrack {
@@ -25,6 +28,14 @@ impl KeepTrack {
             uid,
             default: None,
             forced: None,
+            delay_ms: 0,
+        }
+    }
+
+    pub fn with_delay(uid: usize, delay_ms: i64) -> Self {
+        Self {
+            delay_ms,
+            ..Self::new(uid)
         }
     }
 }
@@ -360,8 +371,10 @@ fn resolve_backend(
         .chain(plan.extra_streams())
         .all(|stream| stream.mkv_id.is_some());
 
-    let needs_mkvmerge =
-        plan.split.is_some() || !plan.append.is_empty() || plan.chapters_file.is_some();
+    let needs_mkvmerge = plan.split.is_some()
+        || !plan.append.is_empty()
+        || plan.chapters_file.is_some()
+        || plan.keep.iter().any(|track| track.delay_ms != 0);
 
     let prefer_mkvmerge = needs_mkvmerge
         || (plan.container.supports_mkvmerge()
@@ -764,6 +777,10 @@ fn mkvmerge_args(info: &MediaInfo, plan: &MuxPlan, output_part: &Path) -> Vec<Os
         if let Some(forced) = entry.forced {
             args.push("--forced-track".into());
             args.push(format!("{id}:{}", yes_no(forced)).into());
+        }
+        if entry.delay_ms != 0 {
+            args.push("--sync".into());
+            args.push(format!("{id}:{}", entry.delay_ms).into());
         }
     }
 

@@ -216,6 +216,50 @@ pub fn start_video_segment(
     stop
 }
 
+/// Играет одну дорожку файла со сдвигом — для окна синхрона внутренних дорожек.
+#[allow(clippy::too_many_arguments)]
+pub fn start_track_preview(
+    tools: ToolPaths,
+    info: MediaInfo,
+    ff_index: usize,
+    at_ms: u64,
+    delay_ms: i64,
+    token: u64,
+    tx: Sender<PreviewMsg>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+
+    std::thread::spawn(move || {
+        let temp: PathBuf = std::env::temp_dir().join(format!(
+            "trackcut_track_{}_{}.wav",
+            std::process::id(),
+            token
+        ));
+
+        if let Err(err) = trackcut_core::preview::extract_track_preview(
+            &tools, &info.path, ff_index, at_ms, delay_ms, 12.0, &temp,
+        ) {
+            let _ = std::fs::remove_file(&temp);
+            let _ = tx.send(PreviewMsg::Error(token, err.to_string()));
+            return;
+        }
+
+        match play_wav(&temp, &flag) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temp);
+                let _ = tx.send(PreviewMsg::Finished(token));
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                let _ = tx.send(PreviewMsg::Error(token, err));
+            }
+        }
+    });
+
+    stop
+}
+
 /// Играет обе дорожки одновременно, чтобы на слух подогнать сдвиг.
 #[allow(clippy::too_many_arguments)]
 pub fn start_pair_preview(

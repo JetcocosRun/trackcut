@@ -24,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Показать дорожки файла.
     Probe {
@@ -68,6 +69,9 @@ enum Command {
         /// Сдвиг добавленных дорожек, мс (положительный — позже).
         #[arg(long = "add-delay", default_value_t = 0)]
         add_delay: i64,
+        /// Сдвиг своей дорожки: UID:МС, можно повторять (например 2:-250).
+        #[arg(long = "delay", value_name = "UID:MS")]
+        delay: Vec<String>,
         /// Импортировать главы из файла (XML, OGM или Matroska).
         #[arg(long, value_name = "FILE")]
         chapters: Option<PathBuf>,
@@ -162,6 +166,7 @@ fn main() {
             mov_text,
             add,
             add_delay,
+            delay,
             chapters,
             split_size,
             split_duration,
@@ -183,6 +188,7 @@ fn main() {
             mov_text,
             &add,
             add_delay,
+            &delay,
             chapters,
             split_size,
             split_duration,
@@ -412,6 +418,7 @@ fn cmd_mux(
     mov_text: bool,
     add: &[PathBuf],
     add_delay: i64,
+    delay: &[String],
     chapters: Option<PathBuf>,
     split_size: Option<String>,
     split_duration: Option<String>,
@@ -462,7 +469,8 @@ fn cmd_mux(
         return Err("выходной файл совпадает с исходным".to_string());
     }
 
-    let selected = select_streams(&info, &keep, &drop)?;
+    let mut selected = select_streams(&info, &keep, &drop)?;
+    apply_delays(&mut selected, delay)?;
     let extras = build_extras(tools, add, add_delay)?;
     let chapters = match chapters {
         Some(path) => {
@@ -814,6 +822,31 @@ fn select_uids(info: &MediaInfo, keep: &[usize], drop: &[usize]) -> Result<Vec<u
     }
 
     Ok(uids)
+}
+
+fn apply_delays(tracks: &mut [trackcut_core::KeepTrack], delays: &[String]) -> Result<(), String> {
+    for value in delays {
+        let (uid, ms) = value
+            .split_once(':')
+            .ok_or_else(|| format!("сдвиг задаётся как UID:МС, получено «{value}»"))?;
+        let uid: usize = uid
+            .trim()
+            .parse()
+            .map_err(|_| format!("не номер дорожки в «{value}»"))?;
+        let uid = uid
+            .checked_sub(1)
+            .ok_or_else(|| format!("номера дорожек начинаются с 1 в «{value}»"))?;
+        let ms: i64 = ms
+            .trim()
+            .parse()
+            .map_err(|_| format!("не число миллисекунд в «{value}»"))?;
+        let track = tracks
+            .iter_mut()
+            .find(|track| track.uid == uid)
+            .ok_or_else(|| format!("дорожка {} не выбрана — сдвиг некуда применить", uid + 1))?;
+        track.delay_ms = ms;
+    }
+    Ok(())
 }
 
 fn select_streams(
